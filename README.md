@@ -1,4 +1,4 @@
-** DockerFS **
+## DockerFS
 
 DockerFS is a simple solution for allowing your friends to use you extra local diskspace and bandwidth as an offsite backup target.
 
