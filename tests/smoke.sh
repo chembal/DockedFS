@@ -76,15 +76,27 @@ STORAGE_SIZE=512M $COMPOSE run --rm --no-deps -T target 2>&1 | grep -q "Refusing
 [ "$(stat -c %s "$TEST_DATA_DIR/disk.img")" -eq 1073741824 ] || fail "image was shrunk"
 ok "shrinking refused, image untouched"
 
+echo "== default mode: no CHAP (no shared secret on the host)"
+export TEST_CHAP_USER="" TEST_CHAP_PASSWORD=""
+t=$(date +%s); $COMPOSE up -d >/dev/null 2>&1; wait_ready "$t"
+docker logs dockedfs-test-target 2>&1 | grep -q "no CHAP" || fail "target did not report no-CHAP mode"
+uclient qemu-io -f raw -c "read -P 0x5a 0 64M" "iscsi://127.0.0.1:$PORT/$IQN/1" | grep -q "read 67108864" \
+  || fail "login without CHAP failed in no-CHAP mode"
+ok "no-CHAP mode: open login, same data"
+TEST_CHAP_USER=onlyuser $COMPOSE run --rm --no-deps -T target 2>&1 | grep -q "set both CHAP_USER and CHAP_PASSWORD" \
+  || fail "half-configured CHAP not rejected"
+ok "half-configured CHAP refused"
+
 if [ "$(id -u)" -ne 0 ] || ! command -v iscsiadm >/dev/null 2>&1; then
   echo "== skipping kernel client tests (run with sudo -E and open-iscsi installed)"
   echo "PASS ($pass checks)"
   exit 0
 fi
 
-echo "== real client (iscsiadm + LUKS + xfs)"
+echo "== real client (iscsiadm + LUKS + xfs, no CHAP)"
 KEY="$TEST_DATA_DIR/luks.key"; head -c 64 /dev/urandom > "$KEY"
-export DOCKEDFS_HOST=127.0.0.1 DOCKEDFS_PORT=$PORT CHAP_USER=tester CHAP_PASSWORD=smoke-test-123 \
+unset CHAP_USER CHAP_PASSWORD
+export DOCKEDFS_HOST=127.0.0.1 DOCKEDFS_PORT=$PORT \
        DOCKEDFS_KEYFILE="$KEY" DOCKEDFS_ASSUME_YES=1 DOCKEDFS_MOUNT="$TEST_DATA_DIR/mnt"
 C=../client/dockedfs-client.sh
 (cd "$TEST_DATA_DIR" && "$OLDPWD/$C" init) </dev/null >/dev/null || fail "client init"

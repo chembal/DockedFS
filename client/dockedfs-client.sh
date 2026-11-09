@@ -14,7 +14,7 @@
 #   DOCKEDFS_HOST      tailnet name or IP of the host    (default: dockedfs)
 #   DOCKEDFS_PORT      iSCSI port                        (default: 3260)
 #   DOCKEDFS_IQN       target name  (default: iqn.2026-11.io.dockedfs:storage)
-#   CHAP_USER, CHAP_PASSWORD   login agreed with the host (required)
+#   CHAP_USER, CHAP_PASSWORD   optional; only if the host enabled CHAP
 #   DOCKEDFS_NAME      device-mapper name                (default: dockedfs)
 #   DOCKEDFS_MOUNT     mount point                       (default: /mnt/dockedfs)
 #   DOCKEDFS_FS        filesystem for init               (default: xfs)
@@ -64,13 +64,17 @@ logged_in() { iscsiadm -m session 2>/dev/null | grep -q " $PORTAL,[0-9]* $IQN"; 
 
 connect() {
   if logged_in; then return 0; fi
-  [ -n "${CHAP_USER:-}" ] && [ -n "${CHAP_PASSWORD:-}" ] || die "set CHAP_USER and CHAP_PASSWORD"
   # Add the node by IP rather than via sendtargets: the host runs Tailscale in
   # userspace mode, so discovery advertises an unreachable container address.
   iscsi >/dev/null 2>&1 || iscsi -o new >/dev/null
-  iscsi -o update -n node.session.auth.authmethod -v CHAP
-  iscsi -o update -n node.session.auth.username -v "$CHAP_USER"
-  iscsi -o update -n node.session.auth.password -v "$CHAP_PASSWORD"
+  if [ -n "${CHAP_USER:-}" ]; then
+    [ -n "${CHAP_PASSWORD:-}" ] || die "CHAP_USER is set but CHAP_PASSWORD is not"
+    iscsi -o update -n node.session.auth.authmethod -v CHAP
+    iscsi -o update -n node.session.auth.username -v "$CHAP_USER"
+    iscsi -o update -n node.session.auth.password -v "$CHAP_PASSWORD"
+  else
+    iscsi -o update -n node.session.auth.authmethod -v None
+  fi
   iscsi --login >/dev/null
   i=0
   until [ -b "$DISK" ]; do

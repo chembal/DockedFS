@@ -27,8 +27,8 @@ services:
       - STORAGE_SIZE=${STORAGE_SIZE:?set STORAGE_SIZE in .env}
       - PREALLOCATE=${PREALLOCATE:-false}
       - MAX_BANDWIDTH_MBIT=${MAX_BANDWIDTH_MBIT:-}
-      - CHAP_USER=${CHAP_USER:?set CHAP_USER in .env}
-      - CHAP_PASSWORD=${CHAP_PASSWORD:?set CHAP_PASSWORD in .env}
+      - CHAP_USER=${CHAP_USER:-}
+      - CHAP_PASSWORD=${CHAP_PASSWORD:-}
     volumes:
       - ${DATA_DIR:-./data}:/storage
     restart: unless-stopped
