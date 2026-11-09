@@ -198,4 +198,4 @@ DockedFS makes it technically impossible for the host to read your data. It is n
 
 ## License
 
-TBD
+[MIT](LICENSE)
