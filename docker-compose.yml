@@ -1,7 +1,7 @@
 # DockedFS host stack. Configure everything in .env (copy .env.example).
 services:
   tailscale:
-    image: tailscale/tailscale:v1.90.6
+    image: tailscale/tailscale:latest
     container_name: dockedfs-tailscale
     hostname: ${TS_HOSTNAME:-dockedfs}
     environment:
