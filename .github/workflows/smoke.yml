@@ -1,0 +1,28 @@
+name: smoke test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint shell scripts
+        run: shellcheck -S warning target/entrypoint.sh client/dockedfs-client.sh tests/smoke.sh
+
+      - name: Validate compose file
+        run: cp .env.example .env && docker compose config -q
+
+      - name: Install iSCSI initiator and LUKS tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y open-iscsi cryptsetup xfsprogs "linux-modules-extra-$(uname -r)" || \
+            sudo apt-get install -y open-iscsi cryptsetup xfsprogs
+          sudo modprobe iscsi_tcp
+          sudo systemctl start iscsid
+
+      - name: Run smoke test (target + real client)
+        run: sudo -E ./tests/smoke.sh
