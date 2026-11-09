@@ -12,7 +12,7 @@ DockedFS is not a new program. It ties together mature, well-understood tools (i
  ┌──────────────────────────┐            ┌─────────────────────────────────┐
  │ /mnt/backup  (xfs, ext4…)│            │ dockedfs-tailscale  (userspace) │
  │      │                   │  tailnet   │        │                        │
- │ LUKS2 (keys stay here)   │◀──────────▶│ dockedfs-target (tgt)           │
+ │ LUKS2 (keys stay here)   │◀─────────▶│ dockedfs-target (tgt)           │
  │      │                   │  WireGuard │        │                        │
  │ iSCSI initiator          │            │ DATA_DIR/disk.img (ciphertext)  │
  └──────────────────────────┘            └─────────────────────────────────┘
