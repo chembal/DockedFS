@@ -85,7 +85,9 @@ In the [Tailscale admin console](https://login.tailscale.com/admin/acls), add a 
 }
 ```
 
-Then [generate an auth key](https://login.tailscale.com/admin/settings/keys) that is **reusable: off, pre-approved: on, tags: `tag:dockedfs`**. Send it to your friend, along with a CHAP username and password that you choose.
+Then [generate an auth key](https://login.tailscale.com/admin/settings/keys) that is **reusable: off, pre-approved: on, tags: `tag:dockedfs`**. Send it to your friend privately, not in a group chat or anywhere public, along with a CHAP username and password that you choose.
+
+> **The tag matters.** A key without a tag joins the host as *your* device. Under the default "allow all" policy, your friend's machine could then reach every device on your tailnet. Once the host is up, `tailscale status` should list it as `tagged-devices`, not under your login.
 
 ### 2. Connect
 
@@ -175,6 +177,7 @@ sudo xfs_growfs /mnt/dockedfs
 |---|---|
 | Host (or anyone with the host's disk) reads your files | **Yes.** They only ever see LUKS2 ciphertext, and the keys never leave the client. |
 | Client reaches the host's LAN or other devices | **Yes.** Userspace Tailscale with no routes. The only thing reachable is the target container on port 3260. |
+| A bug in the iSCSI server is exploited to break into the container | **Partly.** The containers are unprivileged apart from `NET_ADMIN`, but like any container they have normal outbound network access, including to the host's LAN. Keep the image updated. |
 | Host reaches your other tailnet devices | **Yes**, if you apply the ACL above. |
 | Other devices on your tailnet attach the disk | Blocked by CHAP, and by the ACL if you narrow `src`. |
 | Host deletes or withholds your data | **No.** It's their disk. Treat DockedFS as one copy in a 3-2-1 backup strategy, not as the only one. |
