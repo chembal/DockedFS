@@ -89,6 +89,21 @@ Then [generate an auth key](https://login.tailscale.com/admin/settings/keys) tha
 
 ### 2. Connect
 
+**The quick way:** the helper script runs steps 2 to 4 for you.
+
+```sh
+sudo mkdir -p /etc/dockedfs
+printf 'DOCKEDFS_HOST=dockedfs\nCHAP_USER=friend\nCHAP_PASSWORD=change-me-1234\n' | sudo tee /etc/dockedfs/client.conf
+sudo chmod 600 /etc/dockedfs/client.conf
+
+sudo ./client/dockedfs-client.sh init     # first time only: LUKS-format, mkfs, mount
+sudo ./client/dockedfs-client.sh mount    # later: connect, unlock, mount
+sudo ./client/dockedfs-client.sh umount   # unmount, lock, disconnect
+sudo ./client/dockedfs-client.sh status
+```
+
+**The manual way:**
+
 ```sh
 sudo apt-get update && sudo apt-get install -y open-iscsi cryptsetup xfsprogs
 
@@ -173,6 +188,10 @@ DockedFS makes it technically impossible for the host to read your data. It is n
 - **`[dockedfs] ERROR: STORAGE_SIZE ... smaller than the existing disk`**: set `STORAGE_SIZE` back to at least the current size.
 - **Login fails with "Authentication failure"**: the CHAP username or password in your `iscsiadm` settings doesn't match the host's `.env`.
 - **Writes hang when the internet drops**: iSCSI queues I/O for `node.session.timeo.replacement_timeout` seconds (default 120) before failing. For long backups over flaky links, raise this value, and use a backup tool that can resume.
+
+## Testing
+
+`./tests/smoke.sh` starts a throwaway target on localhost. It checks that a sparse disk is created, that CHAP rejects bad logins, that data reads back correctly and survives a restart, and that shrinking is refused. Run it with `sudo -E` (with `open-iscsi` installed) to also test the real client path: LUKS2, xfs, mount, a check that the host only sees ciphertext, remount, and growing the disk while it's online. CI runs the full version on every push.
 
 ## License
 

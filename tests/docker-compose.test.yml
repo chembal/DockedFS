@@ -1,0 +1,18 @@
+# Target only, published on localhost instead of a tailnet. Used by smoke.sh.
+name: dockedfs-test
+services:
+  target:
+    build: ../target
+    image: dockedfs-target:local
+    container_name: dockedfs-test-target
+    cap_add: [NET_ADMIN]
+    environment:
+      - STORAGE_SIZE=${STORAGE_SIZE:-1G}
+      - PREALLOCATE=false
+      - MAX_BANDWIDTH_MBIT=${MAX_BANDWIDTH_MBIT:-}
+      - CHAP_USER=tester
+      - CHAP_PASSWORD=smoke-test-123
+    volumes:
+      - ${TEST_DATA_DIR:?}:/storage
+    ports:
+      - "127.0.0.1:${TEST_PORT:-13260}:3260"
