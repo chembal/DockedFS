@@ -1,64 +1,179 @@
-## DockerFS
+# DockedFS
 
-DockerFS is a simple solution for allowing your friends to use you extra local diskspace and bandwidth as an offsite backup target.
+**Swap spare disk space with friends for encrypted offsite backups. Docker and Tailscale handle the setup, so nobody has to open ports or trust anyone with their data.**
 
-DockerFS is not a new program.  The project uses a collection of mature technologies combined into an easy to use docker-compose.yml file to simplify how you share storage.
+DockedFS is not a new program. It ties together mature, well-understood tools (iSCSI, Tailscale, LUKS) in a single `docker-compose.yml`. The result is easy for a non-expert to run and easy for anyone to audit.
 
-The goals of DockerFS:
+- **The host** (the friend with spare disk) runs two containers. One gives them a single locked-down device on the client's tailnet. The other serves a disk image over iSCSI.
+- **The client** (the friend who needs backup space) connects to it as a raw block device. They encrypt it with LUKS, put any filesystem on it, and mount it like a local drive.
 
- - Make it simple for your friend to offer their surplus disk-space and bandwidth without any risk to themselves other than their expended local resources, which they can control and limit.
- - Use tailscale to allow network access between client and server without any special networking configuration by the host server or their network infrastructure
- - Ensure that by offering their resources as a backup target with DockerFS, the host is not opening their local network to the client.
- - Limit legal liability by ensuring that even compelled access by authorities would only show an encrypted block of data that physically cannot be
-   accessed, since the encryption keys remain on the client.
- - Ensure that the host can limit maximum resource usage by updating simple parameters in docker-compose.yml
-   - Configurable parameters include:
-     - Destination data directory
-     - Maximum storage amount
-     - Grow storage as needed versus pre-allocation
-     - Maximum bandwidth utilization
- - Client side advantages
-   - You control your keys.  They only exist on your client system.
-   - Easy network access via tailscale
-   - Ensure the rest of your tailscale network cannot be browsed by using the shared tailscale key via tailscale ACLs
-   - File system flexibility.
-     - Fundamentally, the server is presenting a block storage device that can be used in any way you'd like.
-     - Any filesystem can be used on the client side.  Use whatever best fits your use-case, mount it, and use it.
-   - Once mounted, you can use the new mount-point any way you'd like.
-     - The primary use-case is for remote backups, but you can use whatever backup technology you prefer.
-       - Use rsync, the traditional go-to for file syncronization
-       - Use duplicati to take advantage of de-duplication, snapshotting, and bandwidth limiting
-       - Simply copy your files to the new mount just like you would any other drive.  Share it over smb if you'd like to allow other systems on your network to backup files there.
+```
+ client machine                          host machine (your friend)
+ ┌──────────────────────────┐            ┌─────────────────────────────────┐
+ │ /mnt/backup  (xfs, ext4…)│            │ dockedfs-tailscale  (userspace) │
+ │      │                   │  tailnet   │        │                        │
+ │ LUKS2 (keys stay here)   │◀──────────▶│ dockedfs-target (tgt, CHAP)     │
+ │      │                   │  WireGuard │        │                        │
+ │ iSCSI initiator          │            │ DATA_DIR/disk.img (ciphertext)  │
+ └──────────────────────────┘            └─────────────────────────────────┘
+```
 
-Host Server Setup:
+## Why
 
- 1. Update docker-compose.yml
-   - Update data folder mapping
-   - Update maximum limits for volume size
-   - Update tailscale key (obtain from client party)
+**For the host**
+- Your only cost is the disk space and bandwidth you choose to give. You set the limits in a single `.env` file.
+- You don't open any ports and you don't change your router.
+- Your LAN stays private. The Tailscale container runs in userspace mode, has no access to the host's network devices, and advertises no routes. Your friend's tailnet can reach that one container, on that one port, and nothing else.
+- You only ever store ciphertext. The encryption keys never leave your friend's machine, so you can't read the data and neither can anyone who gets at your disk.
 
- 2. Run docker container
-   - docker compose up -d
+**For the client**
+- You control the keys.
+- You get a real block device, so you can use any filesystem and any backup tool: rsync, restic, Borg, Duplicati, or a plain `cp`.
+- It works from anywhere, with no port forwarding on either side.
 
-Client Server Setup:
+## Host setup (the friend offering space)
 
-  1. Install tools:
-        - sudo apt-get update && sudo apt-get install -y open-iscsi cryptsetup
-  2. Discover and connect over Tailscale:
-        - sudo iscsiadm -m discovery -t sendtargets -p sudo iscsiadm -m node --login
-  3. Identify device: lsblk
-  4. Format with LUKS2 (4KB block size):
-        - sudo cryptsetup luksFormat --type luks2 --block-size 4096 /dev/sdb
-  5. Open volume:
-        - sudo cryptsetup open /dev/sdb remote_encrypted_disk
-  6. Create filesystem:
-        - sudo mkfs.xfs /dev/mapper/remote_encrypted_disk
-  7. Mount locally:
-        - sudo mkdir -p /mnt/secure_storage
-        - sudo mount /dev/mapper/remote_encrypted_disk /mnt/secure_storage
-  8. Use the technology of your choice to write backups to /mnt/secure_storage
-	- rsync
-	- duplicati
-	- simply copy files there
-  9. (optional) Share the storage on your network via smb/cifs or nfs
-	- Include steps here
+You need Docker with the Compose plugin. Any Linux box, NAS or always-on PC with spare disk will do.
+
+1. Get two things from your friend: a **Tailscale auth key** (see [Client setup](#client-setup), step 1) and a **CHAP username and password**.
+2. Clone the repo and create your config:
+   ```sh
+   git clone https://github.com/chembal/DockedFS.git
+   cd DockedFS
+   cp .env.example .env
+   ```
+3. Edit `.env`:
+
+   | Setting | What it does |
+   |---|---|
+   | `TS_AUTHKEY` | Auth key from your friend. It joins this host to *their* tailnet. |
+   | `CHAP_USER`, `CHAP_PASSWORD` | iSCSI login your friend will use (password must be 12 to 16 characters). |
+   | `DATA_DIR` | Folder on this machine where the disk image lives. |
+   | `STORAGE_SIZE` | Maximum size offered, e.g. `500G` or `2T`. You can raise it later, but never lower it (see below). |
+   | `PREALLOCATE` | `false` grows the file as your friend writes to it. `true` reserves the full size up front. |
+   | `MAX_BANDWIDTH_MBIT` | Optional cap in Mbit/s, applied separately to upload and download. Leave it empty for no cap. |
+
+4. Start it:
+   ```sh
+   docker compose up -d --build
+   docker compose logs -f target   # wait for "[dockedfs] Ready"
+   ```
+5. Tell your friend the host's name on their tailnet (`TS_HOSTNAME`, default `dockedfs`).
+
+**Changing limits.** Edit `.env`, then run `docker compose up -d`. To grow the disk, raise `STORAGE_SIZE`, then have your friend resize on their side (see [Growing the disk](#growing-the-disk)). DockedFS **refuses to start if you lower `STORAGE_SIZE`**, because shrinking the image would destroy your friend's data.
+
+**Stopping for good.** Tell your friend first. Then run `docker compose down` and delete `DATA_DIR/disk.img`.
+
+## Client setup
+
+These steps assume Debian or Ubuntu. Other distros use the same tools under the same names.
+
+### 1. Prepare your tailnet
+
+In the [Tailscale admin console](https://login.tailscale.com/admin/acls), add a tag for the host and limit it to iSCSI only. Remove the default "allow all" rule if your policy still has it.
+
+```jsonc
+{
+  "tagOwners": {
+    "tag:dockedfs": ["autogroup:admin"]
+  },
+  "grants": [
+    // Your devices may reach the DockedFS host on the iSCSI port only.
+    { "src": ["autogroup:member"], "dst": ["tag:dockedfs"], "ip": ["tcp:3260"] }
+    // There is no rule *from* tag:dockedfs, so the host can't reach any of your devices.
+  ]
+}
+```
+
+Then [generate an auth key](https://login.tailscale.com/admin/settings/keys) that is **reusable: off, pre-approved: on, tags: `tag:dockedfs`**. Send it to your friend, along with a CHAP username and password that you choose.
+
+### 2. Connect
+
+```sh
+sudo apt-get update && sudo apt-get install -y open-iscsi cryptsetup xfsprogs
+
+HOST=$(tailscale ip -4 dockedfs)        # the host's tailnet IP
+IQN=iqn.2026-11.io.dockedfs:storage
+CHAP_USER=friend
+CHAP_PASSWORD='change-me-1234'
+
+sudo iscsiadm -m node -o new -T "$IQN" -p "$HOST:3260"
+sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" -o update -n node.session.auth.authmethod -v CHAP
+sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" -o update -n node.session.auth.username -v "$CHAP_USER"
+sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" -o update -n node.session.auth.password -v "$CHAP_PASSWORD"
+sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" --login
+
+DISK=/dev/disk/by-path/ip-$HOST:3260-iscsi-$IQN-lun-1
+lsblk "$DISK"
+```
+
+> The target is added by its tailnet IP instead of through `sendtargets` discovery. Because the host runs Tailscale in userspace mode, discovery reports a container-internal address that you can't reach.
+
+Use the stable `/dev/disk/by-path/...` name, not `/dev/sdX`. `sdX` names can change, and formatting the wrong one destroys a local disk.
+
+### 3. Encrypt, format and mount (first time only)
+
+```sh
+sudo cryptsetup luksFormat --type luks2 --sector-size 4096 "$DISK"
+sudo cryptsetup open "$DISK" dockedfs
+sudo mkfs.xfs /dev/mapper/dockedfs
+sudo mkdir -p /mnt/dockedfs
+sudo mount /dev/mapper/dockedfs /mnt/dockedfs
+```
+
+**Back up your LUKS header and passphrase somewhere other than this disk.** If you lose them, the data is gone:
+```sh
+sudo cryptsetup luksHeaderBackup "$DISK" --header-backup-file dockedfs-luks-header.img
+```
+
+### 4. Reconnect later
+
+```sh
+sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" --login
+sudo cryptsetup open "$DISK" dockedfs
+sudo mount /dev/mapper/dockedfs /mnt/dockedfs
+```
+
+To disconnect, run `sudo umount /mnt/dockedfs && sudo cryptsetup close dockedfs && sudo iscsiadm -m node -T "$IQN" --logout`.
+
+### 5. Back up to it
+
+Anything that writes to a directory works:
+
+- **rsync**: `rsync -aHAX --delete ~/ /mnt/dockedfs/home-backup/`
+- **restic / Borg**: point the repository at `/mnt/dockedfs/repo` to get deduplication and snapshots.
+- **Duplicati**: use `/mnt/dockedfs` as a local-folder destination. Duplicati adds its own bandwidth limiting and scheduling.
+- **Share it on your LAN**: export `/mnt/dockedfs` over Samba or NFS, so other machines on your network can back up there too.
+
+### Growing the disk
+
+Once your friend has raised `STORAGE_SIZE` and restarted:
+```sh
+sudo iscsiadm -m session --rescan
+sudo cryptsetup resize dockedfs
+sudo xfs_growfs /mnt/dockedfs
+```
+
+## Security model
+
+| Threat | Protected? |
+|---|---|
+| Host (or anyone with the host's disk) reads your files | **Yes.** They only ever see LUKS2 ciphertext, and the keys never leave the client. |
+| Client reaches the host's LAN or other devices | **Yes.** Userspace Tailscale with no routes. The only thing reachable is the target container on port 3260. |
+| Host reaches your other tailnet devices | **Yes**, if you apply the ACL above. |
+| Other devices on your tailnet attach the disk | Blocked by CHAP, and by the ACL if you narrow `src`. |
+| Host deletes or withholds your data | **No.** It's their disk. Treat DockedFS as one copy in a 3-2-1 backup strategy, not as the only one. |
+| Host tampers with ciphertext | **Detected only partly.** Plain LUKS2 provides confidentiality, not integrity. Use a backup tool that verifies its data (restic, Borg), or add `--integrity hmac-sha256` to `luksFormat` (slower). |
+| Host learns metadata | The host can see how much is stored and when it's written, but not what it is. |
+
+DockedFS makes it technically impossible for the host to read your data. It is not legal advice. Hosts and clients are each responsible for what they store and where.
+
+## Troubleshooting
+
+- **`[dockedfs] ERROR: STORAGE_SIZE ... smaller than the existing disk`**: set `STORAGE_SIZE` back to at least the current size.
+- **Login fails with "Authentication failure"**: the CHAP username or password in your `iscsiadm` settings doesn't match the host's `.env`.
+- **Writes hang when the internet drops**: iSCSI queues I/O for `node.session.timeo.replacement_timeout` seconds (default 120) before failing. For long backups over flaky links, raise this value, and use a backup tool that can resume.
+
+## License
+
+TBD
