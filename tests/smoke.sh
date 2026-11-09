@@ -76,16 +76,28 @@ STORAGE_SIZE=512M $COMPOSE run --rm --no-deps -T target 2>&1 | grep -q "Refusing
 [ "$(stat -c %s "$TEST_DATA_DIR/disk.img")" -eq 1073741824 ] || fail "image was shrunk"
 ok "shrinking refused, image untouched"
 
-echo "== default mode: no CHAP (no shared secret on the host)"
-export TEST_CHAP_USER="" TEST_CHAP_PASSWORD=""
+echo "== default mode: CHAP login derived from the Tailscale auth key"
+TEST_AUTHKEY=tskey-auth-smoketest-0123456789abcdef
+DERIVED_PW=$(printf %s "$TEST_AUTHKEY" | sha256sum | cut -c1-16)
+export TEST_AUTHKEY TEST_CHAP_USER="" TEST_CHAP_PASSWORD=""
 t=$(date +%s); $COMPOSE up -d >/dev/null 2>&1; wait_ready "$t"
-docker logs dockedfs-test-target 2>&1 | grep -q "no CHAP" || fail "target did not report no-CHAP mode"
-uclient qemu-io -f raw -c "read -P 0x5a 0 64M" "iscsi://127.0.0.1:$PORT/$IQN/1" | grep -q "read 67108864" \
-  || fail "login without CHAP failed in no-CHAP mode"
-ok "no-CHAP mode: open login, same data"
+docker logs --since "$t" dockedfs-test-target 2>&1 | grep -q "derived from TS_AUTHKEY" || fail "target did not derive CHAP"
+uclient iscsi-inq "iscsi://127.0.0.1:$PORT/$IQN/1" >/dev/null 2>&1 && fail "derived mode allowed login without CHAP"
+uclient qemu-io -f raw -c "read -P 0x5a 0 64M" "iscsi://dockedfs%$DERIVED_PW@127.0.0.1:$PORT/$IQN/1" | grep -q "read 67108864" \
+  || fail "derived CHAP login failed"
+ok "derived CHAP: key holder logs in, others rejected"
+TEST_AUTHKEY="" $COMPOSE run --rm --no-deps -T target 2>&1 | grep -q "TS_AUTHKEY is needed" || fail "missing key not reported"
+ok "refuses to run open when the key is missing"
 TEST_CHAP_USER=onlyuser $COMPOSE run --rm --no-deps -T target 2>&1 | grep -q "set both CHAP_USER and CHAP_PASSWORD" \
   || fail "half-configured CHAP not rejected"
 ok "half-configured CHAP refused"
+
+echo "== CHAP_DISABLE=true"
+t=$(date +%s); TEST_CHAP_DISABLE=true $COMPOSE up -d >/dev/null 2>&1; wait_ready "$t"
+uclient qemu-io -f raw -c "read -P 0x5a 0 64M" "iscsi://127.0.0.1:$PORT/$IQN/1" | grep -q "read 67108864" \
+  || fail "open login failed with CHAP disabled"
+ok "CHAP disabled: open login, same data"
+t=$(date +%s); $COMPOSE up -d >/dev/null 2>&1; wait_ready "$t"   # back to derived mode
 
 if [ "$(id -u)" -ne 0 ] || ! command -v iscsiadm >/dev/null 2>&1; then
   echo "== skipping kernel client tests (run with sudo -E and open-iscsi installed)"
@@ -93,9 +105,10 @@ if [ "$(id -u)" -ne 0 ] || ! command -v iscsiadm >/dev/null 2>&1; then
   exit 0
 fi
 
-echo "== real client (iscsiadm + LUKS + xfs, no CHAP)"
+echo "== real client (iscsiadm + LUKS + xfs, derived CHAP)"
 KEY="$TEST_DATA_DIR/luks.key"; head -c 64 /dev/urandom > "$KEY"
 unset CHAP_USER CHAP_PASSWORD
+export DOCKEDFS_AUTHKEY="$TEST_AUTHKEY"
 export DOCKEDFS_HOST=127.0.0.1 DOCKEDFS_PORT=$PORT \
        DOCKEDFS_KEYFILE="$KEY" DOCKEDFS_ASSUME_YES=1 DOCKEDFS_MOUNT="$TEST_DATA_DIR/mnt"
 C=../client/dockedfs-client.sh

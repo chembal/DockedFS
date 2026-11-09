@@ -35,7 +35,7 @@ DockedFS is not a new program. It ties together mature, well-understood tools (i
 
 You need Docker with the Compose plugin. Any Linux box, NAS or always-on PC with spare disk will do.
 
-1. Get a **Tailscale auth key** from your friend (see [Client setup](#client-setup), step 1). It's the only thing you need from them, and it's single-use.
+1. Get a **Tailscale auth key** from your friend (see [Client setup](#client-setup), step 1). It's the only thing you need from them. Leave it in `.env` after the first start, because the iSCSI login is derived from it.
 2. Clone the repo and create your config:
    ```sh
    git clone https://github.com/chembal/DockedFS.git
@@ -47,7 +47,8 @@ You need Docker with the Compose plugin. Any Linux box, NAS or always-on PC with
    | Setting | What it does |
    |---|---|
    | `TS_AUTHKEY` | Auth key from your friend. It joins this host to *their* tailnet. |
-   | `CHAP_USER`, `CHAP_PASSWORD` | Optional, and empty by default. Set both only if your friend asks for an extra iSCSI login (password must be 12 to 16 characters). |
+   | `CHAP_USER`, `CHAP_PASSWORD` | Advanced, and empty by default. The iSCSI (CHAP) login is then derived from `TS_AUTHKEY`, so only your friend can attach the disk. Set both only to use an explicit login instead (password must be 12 to 16 characters). |
+   | `CHAP_DISABLE` | `true` turns the iSCSI login off, so only the tailnet ACL controls access. Not recommended. |
    | `DATA_DIR` | Folder on this machine where the disk image lives. |
    | `STORAGE_SIZE` | Maximum size offered, e.g. `500G` or `2T`. You can raise it later, but never lower it (see below). |
    | `PREALLOCATE` | `false` grows the file as your friend writes to it. `true` reserves the full size up front. |
@@ -85,7 +86,7 @@ In the [Tailscale admin console](https://login.tailscale.com/admin/acls), add a 
 }
 ```
 
-Then [generate an auth key](https://login.tailscale.com/admin/settings/keys) that is **reusable: off, pre-approved: on, tags: `tag:dockedfs`**. Send it to your friend privately, not in a group chat or anywhere public. Once their host has joined, the key is spent.
+Then [generate an auth key](https://login.tailscale.com/admin/settings/keys) that is **reusable: off, pre-approved: on, tags: `tag:dockedfs`**. Send it to your friend privately, not in a group chat or anywhere public. Once their host has joined, the key can't be used to add any other device. **Keep a copy:** the iSCSI login is derived from it, so nobody else on your tailnet can attach or overwrite the disk, and there's no second password to exchange.
 
 > **The tag matters.** A key without a tag joins the host as *your* device. Under the default "allow all" policy, your friend's machine could then reach every device on your tailnet. Once the host is up, `tailscale status` should list it as `tagged-devices`, not under your login.
 
@@ -95,7 +96,8 @@ Then [generate an auth key](https://login.tailscale.com/admin/settings/keys) tha
 
 ```sh
 sudo mkdir -p /etc/dockedfs
-echo 'DOCKEDFS_HOST=dockedfs' | sudo tee /etc/dockedfs/client.conf   # add CHAP_USER/CHAP_PASSWORD only if the host enabled CHAP
+printf 'DOCKEDFS_HOST=dockedfs\nDOCKEDFS_AUTHKEY=tskey-auth-...\n' | sudo tee /etc/dockedfs/client.conf   # the key you gave the host
+sudo chmod 600 /etc/dockedfs/client.conf
 
 sudo ./client/dockedfs-client.sh init     # first time only: LUKS-format, mkfs, mount
 sudo ./client/dockedfs-client.sh mount    # later: connect, unlock, mount
@@ -110,20 +112,21 @@ sudo apt-get update && sudo apt-get install -y open-iscsi cryptsetup xfsprogs
 
 HOST=$(tailscale ip -4 dockedfs)        # the host's tailnet IP
 IQN=iqn.2026-11.io.dockedfs:storage
+AUTHKEY='tskey-auth-...'                 # the key you gave the host
+CHAP_USER=dockedfs
+CHAP_PASSWORD=$(printf %s "$AUTHKEY" | sha256sum | cut -c1-16)
 
 sudo iscsiadm -m node -o new -T "$IQN" -p "$HOST:3260"
+sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" -o update -n node.session.auth.authmethod -v CHAP
+sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" -o update -n node.session.auth.username -v "$CHAP_USER"
+sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" -o update -n node.session.auth.password -v "$CHAP_PASSWORD"
 sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" --login
 
 DISK=/dev/disk/by-path/ip-$HOST:3260-iscsi-$IQN-lun-1
 lsblk "$DISK"
 ```
 
-If the host enabled CHAP, run these before `--login`:
-```sh
-sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" -o update -n node.session.auth.authmethod -v CHAP
-sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" -o update -n node.session.auth.username -v "$CHAP_USER"
-sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" -o update -n node.session.auth.password -v "$CHAP_PASSWORD"
-```
+If the host set an explicit `CHAP_USER`/`CHAP_PASSWORD`, use those instead. If it set `CHAP_DISABLE=true`, skip the three `auth` lines.
 
 > The target is added by its tailnet IP instead of through `sendtargets` discovery. Because the host runs Tailscale in userspace mode, discovery reports a container-internal address that you can't reach.
 
@@ -177,11 +180,11 @@ sudo xfs_growfs /mnt/dockedfs
 | Threat | Protected? |
 |---|---|
 | Host (or anyone with the host's disk) reads your files | **Yes.** They only ever see LUKS2 ciphertext, and the keys never leave the client. |
-| Someone steals the host's hardware, including `.env` | **Nothing useful.** By default no shared secret is stored there. The Tailscale key is single-use and already spent. The node's identity is tagged and can only receive iSCSI connections, and you can revoke it in one click from your admin console. |
+| Someone steals the host's hardware, including `.env` | **Nothing useful.** The used auth key can't add new devices. The iSCSI login derived from it only unlocks ciphertext they already hold. The node's identity is tagged and can only receive iSCSI connections, and you can revoke it in one click from your admin console. |
 | Client reaches the host's LAN or other devices | **Yes.** Userspace Tailscale with no routes. The only thing reachable is the target container on port 3260. |
 | A bug in the iSCSI server is exploited to break into the container | **Partly.** The containers are unprivileged apart from `NET_ADMIN`, but like any container they have normal outbound network access, including to the host's LAN. Keep the image updated. |
 | Host reaches your other tailnet devices | **Yes**, if you apply the ACL above. |
-| Other people's devices on your tailnet attach the disk | **Yes**, if the ACL `src` lists only you. If you can't narrow it, enable CHAP as a second layer. Even a device that attaches the disk only gets ciphertext, but it could overwrite it. |
+| Other people's devices on your tailnet attach or overwrite the disk | **Yes.** They'd need the iSCSI login, which is derived from an auth key only you and the host have seen. Narrowing the ACL `src` to your own login adds a second layer. |
 | Host deletes or withholds your data | **No.** It's their disk. Treat DockedFS as one copy in a 3-2-1 backup strategy, not as the only one. |
 | Host tampers with ciphertext | **Detected only partly.** Plain LUKS2 provides confidentiality, not integrity. Use a backup tool that verifies its data (restic, Borg), or add `--integrity hmac-sha256` to `luksFormat` (slower). |
 | Host learns metadata | The host can see how much is stored and when it's written, but not what it is. |
@@ -191,12 +194,12 @@ DockedFS makes it technically impossible for the host to read your data. It is n
 ## Troubleshooting
 
 - **`[dockedfs] ERROR: STORAGE_SIZE ... smaller than the existing disk`**: set `STORAGE_SIZE` back to at least the current size.
-- **Login fails with "Authentication failure"**: the host has CHAP enabled, and your `iscsiadm` settings don't match its `.env`, or are missing.
+- **Login fails with "Authentication failure"**: the CHAP login doesn't match. Check that `DOCKEDFS_AUTHKEY` is exactly the key in the host's `.env` (`sudo ./client/dockedfs-client.sh chap` prints the derived login).
 - **Writes hang when the internet drops**: iSCSI queues I/O for `node.session.timeo.replacement_timeout` seconds (default 120) before failing. For long backups over flaky links, raise this value, and use a backup tool that can resume.
 
 ## Testing
 
-`./tests/smoke.sh` starts a throwaway target on localhost. It checks that a sparse disk is created, that CHAP (when enabled) rejects bad logins, that the default no-CHAP mode works, that data reads back correctly and survives a restart, and that shrinking is refused. Run it with `sudo -E` (with `open-iscsi` installed) to also test the real client path: LUKS2, xfs, mount, a check that the host only sees ciphertext, remount, and growing the disk while it's online. CI runs the full version on every push.
+`./tests/smoke.sh` starts a throwaway target on localhost. It checks that a sparse disk is created, that CHAP rejects bad logins, that the login derived from the auth key works, that `CHAP_DISABLE` works, that data reads back correctly and survives a restart, and that shrinking is refused. Run it with `sudo -E` (with `open-iscsi` installed) to also test the real client path: LUKS2, xfs, mount, a check that the host only sees ciphertext, remount, and growing the disk while it's online. CI runs the full version on every push.
 
 ## License
 

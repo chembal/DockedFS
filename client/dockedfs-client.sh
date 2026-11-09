@@ -8,13 +8,17 @@
 #   umount      unmount, lock and log out
 #   grow        pick up a larger STORAGE_SIZE from the host
 #   status      show session, mapping and mount state
+#   chap        print the CHAP login derived from DOCKEDFS_AUTHKEY
 #
 # Settings come from the environment or from a config file
 # (DOCKEDFS_CONFIG, default /etc/dockedfs/client.conf):
 #   DOCKEDFS_HOST      tailnet name or IP of the host    (default: dockedfs)
 #   DOCKEDFS_PORT      iSCSI port                        (default: 3260)
 #   DOCKEDFS_IQN       target name  (default: iqn.2026-11.io.dockedfs:storage)
-#   CHAP_USER, CHAP_PASSWORD   optional; only if the host enabled CHAP
+#   DOCKEDFS_AUTHKEY   the Tailscale auth key you gave the host; the CHAP
+#                      login is derived from it (same as the host does)
+#   CHAP_USER, CHAP_PASSWORD   explicit login instead, if the host set one
+#   CHAP_DISABLE=true  the host runs without CHAP
 #   DOCKEDFS_NAME      device-mapper name                (default: dockedfs)
 #   DOCKEDFS_MOUNT     mount point                       (default: /mnt/dockedfs)
 #   DOCKEDFS_FS        filesystem for init               (default: xfs)
@@ -41,6 +45,14 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing '$1' (try: apt-get inst
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo -E $0 ...)"
 need iscsiadm open-iscsi
 need cryptsetup cryptsetup
+
+if [ -z "${CHAP_USER:-}" ] && [ -n "${DOCKEDFS_AUTHKEY:-}" ]; then
+  CHAP_USER=dockedfs
+  CHAP_PASSWORD=$(printf %s "$DOCKEDFS_AUTHKEY" | sha256sum | cut -c1-16)
+fi
+if [ -z "${CHAP_USER:-}" ] && [ "${CHAP_DISABLE:-false}" != "true" ] && [ "${1:-}" != status ]; then
+  die "set DOCKEDFS_AUTHKEY (the auth key you gave the host), or CHAP_USER/CHAP_PASSWORD, or CHAP_DISABLE=true"
+fi
 
 # Resolve a tailnet name to an IP; iscsiadm and /dev/disk/by-path want an IP.
 case "$HOST" in
@@ -152,5 +164,6 @@ case "${1:-}" in
   umount|unmount|disconnect) do_umount ;;
   grow) grow ;;
   status) status ;;
-  *) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  chap) echo "CHAP_USER=${CHAP_USER:-}"; echo "CHAP_PASSWORD=${CHAP_PASSWORD:-}" ;;
+  *) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

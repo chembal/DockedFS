@@ -1,6 +1,6 @@
 #!/bin/sh
 # DockedFS target: serves one sparse (or pre-allocated) disk image over iSCSI
-# with optional CHAP authentication and an optional bandwidth cap.
+# with CHAP authentication and an optional bandwidth cap.
 set -eu
 
 STORAGE_SIZE="${STORAGE_SIZE:?set STORAGE_SIZE in .env, e.g. 500G}"
@@ -12,9 +12,24 @@ CHAP_PASSWORD="${CHAP_PASSWORD:-}"
 
 log() { echo "[dockedfs] $*"; }
 
+# CHAP login, in order of preference:
+#  1. CHAP_USER + CHAP_PASSWORD, if both are set
+#  2. derived from the Tailscale auth key: user "dockedfs", password = first
+#     16 hex chars of sha256(TS_AUTHKEY). Only someone who has seen the key
+#     (the client who made it, and this host) can log in, with nothing extra
+#     to exchange.
+#  3. none, only if CHAP_DISABLE=true
 if { [ -n "$CHAP_USER" ] && [ -z "$CHAP_PASSWORD" ]; } || { [ -z "$CHAP_USER" ] && [ -n "$CHAP_PASSWORD" ]; }; then
   log "ERROR: set both CHAP_USER and CHAP_PASSWORD, or neither."
   exit 1
+fi
+if [ -z "$CHAP_USER" ] && [ "${CHAP_DISABLE:-false}" != "true" ]; then
+  [ -n "${TS_AUTHKEY:-}" ] || { log "ERROR: TS_AUTHKEY is needed to derive the CHAP login (keep it in .env after the first start)."; exit 1; }
+  CHAP_USER=dockedfs
+  CHAP_PASSWORD=$(printf %s "$TS_AUTHKEY" | sha256sum | cut -c1-16)
+  chap_src="derived from TS_AUTHKEY"
+else
+  chap_src="from CHAP_USER/CHAP_PASSWORD"
 fi
 
 # --- Disk image -------------------------------------------------------------
@@ -70,9 +85,9 @@ tgtadm --lld iscsi --mode logicalunit --op new --tid 1 --lun 1 --backing-store "
 if [ -n "$CHAP_USER" ]; then
   tgtadm --lld iscsi --mode account --op new --user "$CHAP_USER" --password "$CHAP_PASSWORD"
   tgtadm --lld iscsi --mode account --op bind --tid 1 --user "$CHAP_USER"
-  auth="CHAP user: $CHAP_USER"
+  auth="CHAP user: $CHAP_USER, $chap_src"
 else
-  auth="no CHAP; access is controlled by the tailnet ACL"
+  auth="CHAP disabled; access is controlled by the tailnet ACL only"
 fi
 tgtadm --lld iscsi --mode target --op bind --tid 1 --initiator-address ALL
 log "Ready: $IQN on port 3260 ($auth)"

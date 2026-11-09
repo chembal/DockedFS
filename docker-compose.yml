@@ -27,6 +27,8 @@ services:
       - STORAGE_SIZE=${STORAGE_SIZE:?set STORAGE_SIZE in .env}
       - PREALLOCATE=${PREALLOCATE:-false}
       - MAX_BANDWIDTH_MBIT=${MAX_BANDWIDTH_MBIT:-}
+      - TS_AUTHKEY=${TS_AUTHKEY} # used only to derive the CHAP login
+      - CHAP_DISABLE=${CHAP_DISABLE:-false}
       - CHAP_USER=${CHAP_USER:-}
       - CHAP_PASSWORD=${CHAP_PASSWORD:-}
     volumes:

@@ -10,6 +10,8 @@ services:
       - STORAGE_SIZE=${STORAGE_SIZE:-1G}
       - PREALLOCATE=false
       - MAX_BANDWIDTH_MBIT=${MAX_BANDWIDTH_MBIT:-}
+      - TS_AUTHKEY=${TEST_AUTHKEY:-}
+      - CHAP_DISABLE=${TEST_CHAP_DISABLE:-false}
       - CHAP_USER=${TEST_CHAP_USER-tester}
       - CHAP_PASSWORD=${TEST_CHAP_PASSWORD-smoke-test-123}
     volumes:
