@@ -92,22 +92,43 @@ Then [generate an auth key](https://login.tailscale.com/admin/settings/keys) tha
 
 > **The tag matters.** A key without a tag joins the host as *your* device. Under the default "allow all" policy, your friend's machine could then reach every device on your tailnet. Once the host is up, `tailscale status` should list it as `tagged-devices`, not under your login.
 
-### 2. Connect
+### 2. Run the setup
 
-**The quick way:** the helper script runs steps 2 to 4 for you.
+On the machine you'll back up from (Debian or Ubuntu with Tailscale connected):
 
 ```sh
-sudo mkdir -p /etc/dockedfs
-printf 'DOCKEDFS_HOST=dockedfs\nDOCKEDFS_AUTHKEY=tskey-auth-...\n' | sudo tee /etc/dockedfs/client.conf   # the key you gave the host
-sudo chmod 600 /etc/dockedfs/client.conf
-
-sudo ./client/dockedfs-client.sh init     # first time only: LUKS-format, mkfs, mount
-sudo ./client/dockedfs-client.sh mount    # later: connect, unlock, mount
-sudo ./client/dockedfs-client.sh umount   # unmount, lock, disconnect
-sudo ./client/dockedfs-client.sh status
+git clone https://github.com/chembal/DockedFS.git
+cd DockedFS/client
+./dockedfs-client.sh
 ```
 
-**The manual way:**
+The script checks where you are and walks you through only what's left:
+
+1. Installs the iSCSI and encryption tools if they're missing.
+2. Asks for the **auth key** you gave your friend. The disk's login is derived from it.
+3. Lists the `tag:dockedfs` hosts on your tailnet so you can pick your friend's.
+4. Connects to it.
+5. On a blank disk, it encrypts it with LUKS2. You can either **generate a strong key** stored in a root-only key file (recommended, and needed for mounting at boot) or **type your own passphrase**.
+6. Creates a filesystem (xfs by default, or ext4).
+7. Asks where to mount it (default `/mnt/dockedfs`) and makes it writable by you.
+8. Offers to **mount it at boot**. A systemd service retries until your friend's host is reachable.
+9. Shows exactly what to **put in your password manager**: the auth key, the encryption key and the LUKS header backup.
+
+Run it again any time. Finished steps are skipped, and if everything is up it just shows the status. Your settings are kept in `/etc/dockedfs/client.conf`, which only root can read.
+
+Day to day, after setup installs it as `dockedfs-client`:
+
+```sh
+sudo dockedfs-client status
+sudo dockedfs-client umount    # unmount, lock, disconnect
+sudo dockedfs-client mount     # connect, unlock, mount
+sudo dockedfs-client grow      # after your friend raises STORAGE_SIZE
+```
+
+### 3. Doing it by hand
+
+<details>
+<summary>Every command the script runs, if you'd rather see or do it yourself</summary>
 
 ```sh
 sudo apt-get update && sudo apt-get install -y open-iscsi cryptsetup xfsprogs
@@ -134,7 +155,7 @@ If the host set an explicit `CHAP_USER`/`CHAP_PASSWORD`, use those instead. If i
 
 Use the stable `/dev/disk/by-path/...` name, not `/dev/sdX`. `sdX` names can change, and formatting the wrong one destroys a local disk.
 
-### 3. Encrypt, format and mount (first time only)
+**Encrypt, format and mount (first time only)**
 
 ```sh
 sudo cryptsetup luksFormat --type luks2 --sector-size 4096 "$DISK"
@@ -149,7 +170,7 @@ sudo mount /dev/mapper/dockedfs /mnt/dockedfs
 sudo cryptsetup luksHeaderBackup "$DISK" --header-backup-file dockedfs-luks-header.img
 ```
 
-### 4. Reconnect later
+**Reconnect later**
 
 ```sh
 sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" --login
@@ -159,7 +180,9 @@ sudo mount /dev/mapper/dockedfs /mnt/dockedfs
 
 To disconnect, run `sudo umount /mnt/dockedfs && sudo cryptsetup close dockedfs && sudo iscsiadm -m node -T "$IQN" --logout`.
 
-### 5. Back up to it
+</details>
+
+### 4. Back up to it
 
 Anything that writes to a directory works:
 
@@ -170,7 +193,7 @@ Anything that writes to a directory works:
 
 ### Growing the disk
 
-Once your friend has raised `STORAGE_SIZE` and restarted:
+Once your friend has raised `STORAGE_SIZE` and restarted, run `sudo dockedfs-client grow`, or by hand:
 ```sh
 sudo iscsiadm -m session --rescan
 sudo cryptsetup resize dockedfs
@@ -196,12 +219,12 @@ DockedFS makes it technically impossible for the host to read your data. It is n
 ## Troubleshooting
 
 - **`[dockedfs] ERROR: STORAGE_SIZE ... smaller than the existing disk`**: set `STORAGE_SIZE` back to at least the current size.
-- **Login fails with "Authentication failure"**: the CHAP login doesn't match. Check that `DOCKEDFS_AUTHKEY` is exactly the key in the host's `.env` (`sudo ./client/dockedfs-client.sh chap` prints the derived login).
+- **Login fails with "Authentication failure"**: the CHAP login doesn't match. Check that `DOCKEDFS_AUTHKEY` is exactly the key in the host's `.env` (`sudo dockedfs-client chap` prints the derived login).
 - **Writes hang when the internet drops**: iSCSI queues I/O for `node.session.timeo.replacement_timeout` seconds (default 120) before failing. For long backups over flaky links, raise this value, and use a backup tool that can resume.
 
 ## Testing
 
-`./tests/smoke.sh` starts a throwaway target on localhost. It checks that a sparse disk is created, that CHAP rejects bad logins, that the login derived from the auth key works, that `CHAP_DISABLE` works, that data reads back correctly and survives a restart, and that shrinking is refused. Run it with `sudo -E` (with `open-iscsi` installed) to also test the real client path: LUKS2, xfs, mount, a check that the host only sees ciphertext, remount, and growing the disk while it's online. CI runs the full version on every push.
+`./tests/smoke.sh` starts a throwaway target on localhost. It checks that a sparse disk is created, that CHAP rejects bad logins, that the login derived from the auth key works, that `CHAP_DISABLE` works, that data reads back correctly and survives a restart, and that shrinking is refused. Run it with `sudo -E` (with `open-iscsi` installed) to also test the real client path: LUKS2, xfs, mount, a check that the host only sees ciphertext, remount, growing the disk while it's online, and the guided setup end to end. CI runs the full version on every push.
 
 ## License
 
