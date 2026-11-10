@@ -154,7 +154,7 @@ ok "grow 1G -> 2G online, data intact"
 echo "== guided setup (./dockedfs-client.sh with no arguments)"
 if ! client umount </dev/null >/dev/null; then
   echo "--- diagnostics"; findmnt -S /dev/mapper/dockedfs || true; dmsetup info dockedfs || true
-  ls -l /sys/block/*/holders/ 2>/dev/null | grep -B1 dm || true
+  for h in /sys/block/*/holders/*; do [ -e "$h" ] && echo "$h"; done
   grep dockedfs /proc/*/mountinfo 2>/dev/null | cut -d: -f1 | sort -u | head || true
   fuser -vm /dev/mapper/dockedfs 2>&1 || true; lsblk || true
   fail "umount before wizard test"
