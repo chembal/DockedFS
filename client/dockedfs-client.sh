@@ -193,7 +193,15 @@ do_mount() {
 
 do_umount() {
   if mountpoint -q "$MNT"; then umount "$MNT"; fi
-  if [ -b "$MAPPER" ]; then cryptsetup close "$NAME"; fi
+  if [ -b "$MAPPER" ]; then
+    # Right after an unmount the device can be briefly busy (udev, flushes); retry.
+    local i=0
+    command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+    until cryptsetup close "$NAME" 2>/dev/null; do
+      i=$((i + 1)); [ "$i" -ge 10 ] && { cryptsetup close "$NAME"; break; }
+      sleep 1
+    done
+  fi
   if [ -n "$HOST" ] && logged_in; then iscsi --logout >/dev/null; fi
   return 0
 }
