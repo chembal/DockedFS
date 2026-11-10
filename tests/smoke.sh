@@ -43,7 +43,7 @@ wait_ready() {
 uclient() { docker run --rm --network host "$CLIENT_IMG" "$@" 2>/dev/null; }
 
 echo "== building images"
-$COMPOSE build -q
+$COMPOSE build --progress plain > "$TEST_DATA_DIR/build.log" 2>&1 || { tail -40 "$TEST_DATA_DIR/build.log"; fail "image build"; }
 docker build -q -t "$CLIENT_IMG" - >/dev/null <<'EOF'
 FROM ubuntu:latest
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
