@@ -23,7 +23,7 @@ cleanup() {
   if [ "$(id -u)" -eq 0 ]; then
     for conf in client.conf wizard.conf; do
       DOCKEDFS_CONFIG="$TEST_DATA_DIR/conf/$conf" DOCKEDFS_HOST=127.0.0.1 DOCKEDFS_PORT=$PORT \
-        DOCKEDFS_AUTHKEY=x DOCKEDFS_MOUNT="$TEST_DATA_DIR/mnt" ../client/dockedfs-client.sh umount >/dev/null 2>&1
+        DOCKEDFS_AUTHKEY=x DOCKEDFS_MOUNT="$TEST_DATA_DIR/mnt" timeout 60 ../client/dockedfs-client.sh umount </dev/null >/dev/null 2>&1
     done
     iscsiadm -m node -T "$IQN" -p "127.0.0.1:$PORT" -o delete >/dev/null 2>&1
   fi
@@ -43,7 +43,7 @@ wait_ready() {
 uclient() { docker run --rm --network host "$CLIENT_IMG" "$@" 2>/dev/null; }
 
 echo "== building images"
-$COMPOSE build --progress plain > "$TEST_DATA_DIR/build.log" 2>&1 || { tail -40 "$TEST_DATA_DIR/build.log"; fail "image build"; }
+timeout 600 $COMPOSE build --progress plain > "$TEST_DATA_DIR/build.log" 2>&1 || { tail -40 "$TEST_DATA_DIR/build.log"; fail "image build"; }
 docker build -q -t "$CLIENT_IMG" - >/dev/null <<'EOF'
 FROM ubuntu:latest
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -113,14 +113,16 @@ unset CHAP_USER CHAP_PASSWORD
 export DOCKEDFS_AUTHKEY="$TEST_AUTHKEY" DOCKEDFS_CONFIG="$TEST_DATA_DIR/conf/client.conf"
 export DOCKEDFS_HOST=127.0.0.1 DOCKEDFS_PORT=$PORT \
        DOCKEDFS_KEYFILE="$KEY" DOCKEDFS_ASSUME_YES=1 DOCKEDFS_MOUNT="$TEST_DATA_DIR/mnt"
-C=../client/dockedfs-client.sh
-(cd "$TEST_DATA_DIR" && "$OLDPWD/$C" init) </dev/null >/dev/null || fail "client init"
+CLI="$(pwd)/../client/dockedfs-client.sh"
+# Every client call gets a time limit, so a hang fails loudly instead of stalling CI.
+client() { echo "    \$ dockedfs-client $*" >&2; timeout 240 "$CLI" "$@"; }
+client init </dev/null >/dev/null || fail "client init"
 ok "client init (LUKS2 + xfs + mount)"
 
 head -c 32M /dev/urandom > "$TEST_DATA_DIR/payload"
 cp "$TEST_DATA_DIR/payload" "$DOCKEDFS_MOUNT/"
 sum=$(sha256sum < "$TEST_DATA_DIR/payload")
-$C umount >/dev/null || fail "umount"
+client umount </dev/null >/dev/null || fail "umount"
 ok "write 32M, unmount and log out"
 
 python3 - "$TEST_DATA_DIR/payload" "$TEST_DATA_DIR/disk.img" <<'PY' || fail "plaintext visible on host"
@@ -131,7 +133,7 @@ PY
 cryptsetup isLuks "$TEST_DATA_DIR/disk.img" || fail "host image is not LUKS"
 ok "host only holds a LUKS volume"
 
-$C mount >/dev/null || fail "remount"
+client mount </dev/null >/dev/null || fail "remount"
 [ "$(sha256sum < "$DOCKEDFS_MOUNT/payload")" = "$sum" ] || fail "checksum mismatch after remount"
 ok "remount and checksum matches"
 
@@ -140,14 +142,14 @@ t=$(date +%s); STORAGE_SIZE=2G $COMPOSE up -d >/dev/null 2>&1; wait_ready "$t"
 i=0; until iscsiadm -m session -P 3 2>/dev/null | grep -q "Session State: LOGGED_IN"; do
   i=$((i + 1)); [ "$i" -gt 30 ] && fail "session did not recover after target restart"; sleep 1
 done
-$C grow >/dev/null || fail "grow"
+client grow </dev/null >/dev/null || fail "grow"
 fs_bytes=$(df -B1 --output=size "$DOCKEDFS_MOUNT" | tail -1)
 [ "$fs_bytes" -gt 1500000000 ] || fail "filesystem did not grow ($fs_bytes)"
 [ "$(sha256sum < "$DOCKEDFS_MOUNT/payload")" = "$sum" ] || fail "data damaged by grow"
 ok "grow 1G -> 2G online, data intact"
 
 echo "== guided setup (./dockedfs-client.sh with no arguments)"
-$C umount >/dev/null || fail "umount before wizard test"
+client umount </dev/null >/dev/null || fail "umount before wizard test"
 iscsiadm -m node -T "$IQN" -p "127.0.0.1:$PORT" -o delete >/dev/null 2>&1 || true
 $COMPOSE down >/dev/null 2>&1
 docker run --rm -v "$TEST_DATA_DIR:/d" alpine rm -f /d/disk.img
@@ -158,7 +160,7 @@ WMNT="$TEST_DATA_DIR/wizard-mnt"
 # Answers, in order: auth key, host (no tailscale on CI, so typed in), erase
 # confirmation, key choice (generate), filesystem (default), mount point,
 # mount at boot (no), "press Enter once you've saved the keys".
-printf '%s\n' "$TEST_AUTHKEY" 127.0.0.1 yes 1 "" "$WMNT" n "" | $C > "$TEST_DATA_DIR/wizard.log" 2>&1 \
+printf '%s\n' "$TEST_AUTHKEY" 127.0.0.1 yes 1 "" "$WMNT" n "" | client > "$TEST_DATA_DIR/wizard.log" 2>&1 \
   || { cat "$TEST_DATA_DIR/wizard.log"; fail "guided setup"; }
 mountpoint -q "$WMNT" || { cat "$TEST_DATA_DIR/wizard.log"; fail "guided setup did not mount"; }
 grep -q "^DOCKEDFS_SETUP_DONE='yes'" "$DOCKEDFS_CONFIG" || fail "setup not recorded"
@@ -170,14 +172,14 @@ grep -q "LUKS header backup" "$TEST_DATA_DIR/wizard.log" || fail "header backup 
 ok "guided setup: key entry, host, LUKS with generated key, xfs, mount, key reminder"
 
 echo hello > "$WMNT/file"
-$C </dev/null > "$TEST_DATA_DIR/wizard2.log" 2>&1 || { cat "$TEST_DATA_DIR/wizard2.log"; fail "second run"; }
+client </dev/null > "$TEST_DATA_DIR/wizard2.log" 2>&1 || { cat "$TEST_DATA_DIR/wizard2.log"; fail "second run"; }
 grep -q "All set" "$TEST_DATA_DIR/wizard2.log" || fail "second run did not finish"
 grep -q "Back up your keys" "$TEST_DATA_DIR/wizard2.log" && fail "second run repeated the key reminder"
 ok "re-running asks nothing and just shows status"
 
-$C umount >/dev/null || fail "umount after wizard"
+client umount </dev/null >/dev/null || fail "umount after wizard"
 mountpoint -q "$WMNT" && fail "still mounted"
-$C </dev/null > "$TEST_DATA_DIR/wizard3.log" 2>&1 || { cat "$TEST_DATA_DIR/wizard3.log"; fail "remount via wizard"; }
+client </dev/null > "$TEST_DATA_DIR/wizard3.log" 2>&1 || { cat "$TEST_DATA_DIR/wizard3.log"; fail "remount via wizard"; }
 [ "$(cat "$WMNT/file")" = hello ] || fail "data lost across wizard remount"
 ok "after unmount, re-running reconnects and remounts with the key file"
 
