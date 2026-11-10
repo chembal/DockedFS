@@ -2,7 +2,10 @@
 name: dockedfs-test
 services:
   target:
-    build: ../target
+    build:
+      context: ../target
+      args:
+        UBUNTU_MIRROR: ${UBUNTU_MIRROR:-}
     image: dockedfs-target:local
     container_name: dockedfs-test-target
     cap_add: [NET_ADMIN]

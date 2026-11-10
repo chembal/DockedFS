@@ -44,9 +44,12 @@ uclient() { docker run --rm --network host "$CLIENT_IMG" "$@" 2>/dev/null; }
 
 echo "== building images"
 timeout 600 $COMPOSE build --progress plain > "$TEST_DATA_DIR/build.log" 2>&1 || { tail -40 "$TEST_DATA_DIR/build.log"; fail "image build"; }
-docker build -q -t "$CLIENT_IMG" - >/dev/null <<'EOF'
+timeout 600 docker build -q --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" -t "$CLIENT_IMG" - >/dev/null <<'EOF' || fail "test client build"
 FROM ubuntu:latest
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+ARG UBUNTU_MIRROR=
+RUN if [ -n "$UBUNTU_MIRROR" ]; then sed -i "s#http://archive.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g; s#http://security.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g" /etc/apt/sources.list.d/ubuntu.sources; fi \
+ && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+ && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     libiscsi-bin qemu-utils qemu-block-extra && rm -rf /var/lib/apt/lists/*
 EOF
 
