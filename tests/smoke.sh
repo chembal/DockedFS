@@ -9,6 +9,9 @@ cd "$(dirname "$0")"
 PORT="${TEST_PORT:-13260}"
 IQN=iqn.2026-11.io.dockedfs:storage
 TEST_DATA_DIR="$(mktemp -d)"
+# Client-side files live outside the host data dir: that dir is bind-mounted into
+# the target container, which would otherwise pin any filesystem mounted inside it.
+CLIENT_DIR="$(mktemp -d)"
 export TEST_PORT="$PORT" TEST_DATA_DIR STORAGE_SIZE=1G
 COMPOSE="docker compose -f docker-compose.test.yml"
 URL="iscsi://tester%smoke-test-123@127.0.0.1:$PORT/$IQN/1"
@@ -22,14 +25,14 @@ cleanup() {
   set +e
   if [ "$(id -u)" -eq 0 ]; then
     for conf in client.conf wizard.conf; do
-      DOCKEDFS_CONFIG="$TEST_DATA_DIR/conf/$conf" DOCKEDFS_HOST=127.0.0.1 DOCKEDFS_PORT=$PORT \
-        DOCKEDFS_AUTHKEY=x DOCKEDFS_MOUNT="$TEST_DATA_DIR/mnt" timeout 60 ../client/dockedfs-client.sh umount </dev/null >/dev/null 2>&1
+      DOCKEDFS_CONFIG="$CLIENT_DIR/conf/$conf" DOCKEDFS_HOST=127.0.0.1 DOCKEDFS_PORT=$PORT \
+        DOCKEDFS_AUTHKEY=x DOCKEDFS_MOUNT="$CLIENT_DIR/mnt" timeout 60 ../client/dockedfs-client.sh umount </dev/null >/dev/null 2>&1
     done
     iscsiadm -m node -T "$IQN" -p "127.0.0.1:$PORT" -o delete >/dev/null 2>&1
   fi
   $COMPOSE down -v >/dev/null 2>&1
   docker run --rm -v "$TEST_DATA_DIR:/d" alpine rm -rf /d/disk.img >/dev/null 2>&1
-  rm -rf "$TEST_DATA_DIR"
+  rm -rf "$TEST_DATA_DIR" "$CLIENT_DIR"
 }
 trap cleanup EXIT
 
@@ -111,24 +114,24 @@ if [ "$(id -u)" -ne 0 ] || ! command -v iscsiadm >/dev/null 2>&1; then
 fi
 
 echo "== real client (iscsiadm + LUKS + xfs, derived CHAP)"
-KEY="$TEST_DATA_DIR/luks.key"; head -c 64 /dev/urandom > "$KEY"
+KEY="$CLIENT_DIR/luks.key"; head -c 64 /dev/urandom > "$KEY"
 unset CHAP_USER CHAP_PASSWORD
-export DOCKEDFS_AUTHKEY="$TEST_AUTHKEY" DOCKEDFS_CONFIG="$TEST_DATA_DIR/conf/client.conf"
+export DOCKEDFS_AUTHKEY="$TEST_AUTHKEY" DOCKEDFS_CONFIG="$CLIENT_DIR/conf/client.conf"
 export DOCKEDFS_HOST=127.0.0.1 DOCKEDFS_PORT=$PORT \
-       DOCKEDFS_KEYFILE="$KEY" DOCKEDFS_ASSUME_YES=1 DOCKEDFS_MOUNT="$TEST_DATA_DIR/mnt"
+       DOCKEDFS_KEYFILE="$KEY" DOCKEDFS_ASSUME_YES=1 DOCKEDFS_MOUNT="$CLIENT_DIR/mnt"
 CLI="$(pwd)/../client/dockedfs-client.sh"
 # Every client call gets a time limit, so a hang fails loudly instead of stalling CI.
 client() { echo "    \$ dockedfs-client $*" >&2; timeout 240 "$CLI" "$@"; }
 client init </dev/null >/dev/null || fail "client init"
 ok "client init (LUKS2 + xfs + mount)"
 
-head -c 32M /dev/urandom > "$TEST_DATA_DIR/payload"
-cp "$TEST_DATA_DIR/payload" "$DOCKEDFS_MOUNT/"
-sum=$(sha256sum < "$TEST_DATA_DIR/payload")
+head -c 32M /dev/urandom > "$CLIENT_DIR/payload"
+cp "$CLIENT_DIR/payload" "$DOCKEDFS_MOUNT/"
+sum=$(sha256sum < "$CLIENT_DIR/payload")
 client umount </dev/null >/dev/null || fail "umount"
 ok "write 32M, unmount and log out"
 
-python3 - "$TEST_DATA_DIR/payload" "$TEST_DATA_DIR/disk.img" <<'PY' || fail "plaintext visible on host"
+python3 - "$CLIENT_DIR/payload" "$TEST_DATA_DIR/disk.img" <<'PY' || fail "plaintext visible on host"
 import sys
 needle = open(sys.argv[1], "rb").read(1 << 20)[4096:8192]
 sys.exit(1 if needle in open(sys.argv[2], "rb").read() else 0)
@@ -164,31 +167,31 @@ $COMPOSE down >/dev/null 2>&1
 docker run --rm -v "$TEST_DATA_DIR:/d" alpine rm -f /d/disk.img
 t=$(date +%s); $COMPOSE up -d >/dev/null 2>&1; wait_ready "$t"   # a fresh, blank disk
 unset DOCKEDFS_AUTHKEY DOCKEDFS_HOST DOCKEDFS_KEYFILE DOCKEDFS_ASSUME_YES DOCKEDFS_MOUNT
-export DOCKEDFS_CONFIG="$TEST_DATA_DIR/conf/wizard.conf"
-WMNT="$TEST_DATA_DIR/wizard-mnt"
+export DOCKEDFS_CONFIG="$CLIENT_DIR/conf/wizard.conf"
+WMNT="$CLIENT_DIR/wizard-mnt"
 # Answers, in order: auth key, host (no tailscale on CI, so typed in), erase
 # confirmation, key choice (generate), filesystem (default), mount point,
 # mount at boot (no), "press Enter once you've saved the keys".
-printf '%s\n' "$TEST_AUTHKEY" 127.0.0.1 yes 1 "" "$WMNT" n "" | client > "$TEST_DATA_DIR/wizard.log" 2>&1 \
-  || { cat "$TEST_DATA_DIR/wizard.log"; fail "guided setup"; }
-mountpoint -q "$WMNT" || { cat "$TEST_DATA_DIR/wizard.log"; fail "guided setup did not mount"; }
+printf '%s\n' "$TEST_AUTHKEY" 127.0.0.1 yes 1 "" "$WMNT" n "" | client > "$CLIENT_DIR/wizard.log" 2>&1 \
+  || { cat "$CLIENT_DIR/wizard.log"; fail "guided setup"; }
+mountpoint -q "$WMNT" || { cat "$CLIENT_DIR/wizard.log"; fail "guided setup did not mount"; }
 grep -q "^DOCKEDFS_SETUP_DONE='yes'" "$DOCKEDFS_CONFIG" || fail "setup not recorded"
 [ "$(stat -c %a "$DOCKEDFS_CONFIG")" = 600 ] || fail "config is not root-only"
-kf="$TEST_DATA_DIR/conf/dockedfs.key"
+kf="$CLIENT_DIR/conf/dockedfs.key"
 [ "$(stat -c %a "$kf")" = 400 ] || fail "key file permissions"
-grep -qF "$(cat "$kf")" "$TEST_DATA_DIR/wizard.log" || fail "generated key not shown in the backup reminder"
-grep -q "LUKS header backup" "$TEST_DATA_DIR/wizard.log" || fail "header backup not mentioned"
+grep -qF "$(cat "$kf")" "$CLIENT_DIR/wizard.log" || fail "generated key not shown in the backup reminder"
+grep -q "LUKS header backup" "$CLIENT_DIR/wizard.log" || fail "header backup not mentioned"
 ok "guided setup: key entry, host, LUKS with generated key, xfs, mount, key reminder"
 
 echo hello > "$WMNT/file"
-client </dev/null > "$TEST_DATA_DIR/wizard2.log" 2>&1 || { cat "$TEST_DATA_DIR/wizard2.log"; fail "second run"; }
-grep -q "All set" "$TEST_DATA_DIR/wizard2.log" || fail "second run did not finish"
-grep -q "Back up your keys" "$TEST_DATA_DIR/wizard2.log" && fail "second run repeated the key reminder"
+client </dev/null > "$CLIENT_DIR/wizard2.log" 2>&1 || { cat "$CLIENT_DIR/wizard2.log"; fail "second run"; }
+grep -q "All set" "$CLIENT_DIR/wizard2.log" || fail "second run did not finish"
+grep -q "Back up your keys" "$CLIENT_DIR/wizard2.log" && fail "second run repeated the key reminder"
 ok "re-running asks nothing and just shows status"
 
 client umount </dev/null >/dev/null || fail "umount after wizard"
 mountpoint -q "$WMNT" && fail "still mounted"
-client </dev/null > "$TEST_DATA_DIR/wizard3.log" 2>&1 || { cat "$TEST_DATA_DIR/wizard3.log"; fail "remount via wizard"; }
+client </dev/null > "$CLIENT_DIR/wizard3.log" 2>&1 || { cat "$CLIENT_DIR/wizard3.log"; fail "remount via wizard"; }
 [ "$(cat "$WMNT/file")" = hello ] || fail "data lost across wizard remount"
 ok "after unmount, re-running reconnects and remounts with the key file"
 
