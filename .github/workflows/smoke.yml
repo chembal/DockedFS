@@ -7,6 +7,7 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
@@ -25,4 +26,5 @@ jobs:
           sudo systemctl start iscsid
 
       - name: Run smoke test (target + real client)
-        run: sudo -E ./tests/smoke.sh
+        # The runner's own Azure mirror is far more reliable from here than archive.ubuntu.com.
+        run: sudo UBUNTU_MIRROR=http://azure.archive.ubuntu.com/ubuntu ./tests/smoke.sh
