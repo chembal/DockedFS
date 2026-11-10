@@ -140,11 +140,12 @@ connect() {
   else
     iscsi -o update -n node.session.auth.authmethod -v None
   fi
-  if ! iscsi --login >/dev/null 2>"$CONFDIR/.login.err"; then
-    if grep -qi auth "$CONFDIR/.login.err"; then
-      die "the host rejected the login. Check that the auth key is exactly the one in the host's .env."
-    fi
-    cat "$CONFDIR/.login.err" >&2
+  local err
+  if ! err=$(iscsi --login 2>&1 >/dev/null); then
+    case "$err" in *[Aa]uth*)
+      die "the host rejected the login. Check that the auth key is exactly the one in the host's .env." ;;
+    esac
+    printf '%s\n' "$err" >&2
     die "could not connect to $PORTAL. Is the host up, and does your tailnet ACL allow tcp:3260 to it?"
   fi
   local i=0
@@ -496,6 +497,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exec sudo DOCKEDFS_CONFIG="$CONFIG" "$0" "$@"
 fi
 
+mkdir -p "$CONFDIR" && chmod 700 "$CONFDIR"
 load_config
 apply_defaults
 
