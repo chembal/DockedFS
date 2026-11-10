@@ -43,7 +43,7 @@ uclient() { docker run --rm --network host "$CLIENT_IMG" "$@" 2>/dev/null; }
 echo "== building images"
 $COMPOSE build -q
 docker build -q -t "$CLIENT_IMG" - >/dev/null <<'EOF'
-FROM ubuntu:24.04
+FROM ubuntu:latest
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     libiscsi-bin qemu-utils qemu-block-extra && rm -rf /var/lib/apt/lists/*
 EOF
