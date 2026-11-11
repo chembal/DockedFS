@@ -136,8 +136,8 @@ sudo apt-get update && sudo apt-get install -y open-iscsi cryptsetup xfsprogs
 HOST=$(tailscale ip -4 dockedfs)        # the host's tailnet IP
 IQN=iqn.2026-11.io.dockedfs:storage
 AUTHKEY='tskey-auth-...'                 # the key you gave the host
-CHAP_USER=dockedfs
-CHAP_PASSWORD=$(printf %s "$AUTHKEY" | sha256sum | cut -c1-16)
+CHAP_PASSWORD=$(printf %s "$AUTHKEY" | sha256sum | cut -c1-16)   # first 16 hex chars of the hash
+CHAP_USER=$(printf %s "$AUTHKEY" | sha256sum | cut -c17-32)       # next 16
 
 sudo iscsiadm -m node -o new -T "$IQN" -p "$HOST:3260"
 sudo iscsiadm -m node -T "$IQN" -p "$HOST:3260" -o update -n node.session.auth.authmethod -v CHAP

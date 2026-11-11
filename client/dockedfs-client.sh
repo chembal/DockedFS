@@ -98,8 +98,10 @@ apply_defaults() {
   MAPPER="/dev/mapper/$NAME"
   BATCH=""; [ "${DOCKEDFS_ASSUME_YES:-0}" = 1 ] && BATCH="--batch-mode"
   if [ -z "${CHAP_USER:-}" ] && [ -n "${DOCKEDFS_AUTHKEY:-}" ]; then
-    CHAP_USER=dockedfs
-    CHAP_PASSWORD=$(printf %s "$DOCKEDFS_AUTHKEY" | sha256sum | cut -c1-16)
+    # Same derivation as the host: h = sha256(auth key); password h[0:16], user h[16:32]
+    local h; h=$(printf %s "$DOCKEDFS_AUTHKEY" | sha256sum)
+    CHAP_PASSWORD=$(echo "$h" | cut -c1-16)
+    CHAP_USER=$(echo "$h" | cut -c17-32)
   fi
   HOST="${DOCKEDFS_HOST:-}"
   case "$HOST" in
