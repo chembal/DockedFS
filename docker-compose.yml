@@ -11,6 +11,8 @@ services:
       # client's tailnet can only ever reach this container, never your LAN.
       - TS_USERSPACE=true
       - TS_ACCEPT_DNS=false
+      # Don't upload this node's logs to Tailscale.
+      - TS_TAILSCALED_EXTRA_ARGS=--no-logs-no-support
     volumes:
       - ts-state:/var/lib/tailscale
     restart: unless-stopped
@@ -21,8 +23,20 @@ services:
     container_name: dockedfs-target
     network_mode: service:tailscale
     depends_on: [tailscale]
+    # Least privilege: the entrypoint (root) only sets up the firewall, the
+    # bandwidth cap and the disk image, then runs the iSCSI server as "tgt".
+    cap_drop: [ALL]
     cap_add:
-      - NET_ADMIN # only used for the optional bandwidth cap
+      - NET_ADMIN        # firewall and bandwidth cap
+      - SETUID           # drop to the tgt user
+      - SETGID
+      - CHOWN            # give the disk image to tgt
+      - DAC_OVERRIDE     # create/grow the image in DATA_DIR
+      - FOWNER
+      - NET_BIND_SERVICE # port 3260, kept by tgt only
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/run, /tmp]
     environment:
       - STORAGE_SIZE=${STORAGE_SIZE:?set STORAGE_SIZE in .env}
       - PREALLOCATE=${PREALLOCATE:-false}
@@ -31,6 +45,7 @@ services:
       - CHAP_DISABLE=${CHAP_DISABLE:-false}
       - CHAP_USER=${CHAP_USER:-}
       - CHAP_PASSWORD=${CHAP_PASSWORD:-}
+      - FIREWALL=${FIREWALL:-true}
     volumes:
       - ${DATA_DIR:-./data}:/storage
     restart: unless-stopped

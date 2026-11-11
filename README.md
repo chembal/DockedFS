@@ -23,7 +23,7 @@ DockedFS is not a new program. It ties together mature, well-understood tools (i
 **For the host**
 - Your only cost is the disk space and bandwidth you choose to give. You set the limits in a single `.env` file.
 - You don't open any ports and you don't change your router.
-- Your LAN stays private. The Tailscale container runs in userspace mode, has no access to the host's network devices, and advertises no routes. Your friend's tailnet can reach that one container, on that one port, and nothing else.
+- Your LAN stays private. Tailscale runs in userspace mode and advertises no routes, so your friend's tailnet can reach one port in one container and nothing else. A built-in firewall also stops the containers from reaching your LAN, router, NAS or anything else on private addresses. The only traffic it lets out is what Tailscale itself needs (see [What the host's firewall allows](#what-the-hosts-firewall-allows)).
 - You only ever store ciphertext. The encryption keys never leave your friend's machine, so you can't read the data and neither can anyone who gets at your disk.
 
 **For the client**
@@ -206,13 +206,29 @@ sudo xfs_growfs /mnt/dockedfs
 |---|---|
 | Host (or anyone with the host's disk) reads your files | **Yes.** They only ever see LUKS2 ciphertext, and the keys never leave the client. |
 | Someone steals the host's hardware, including `.env` | **Nothing useful.** The used auth key can't add new devices. The iSCSI login derived from it only unlocks ciphertext they already hold. The node's identity is tagged and can only receive iSCSI connections, and you can revoke it in one click from your admin console. |
-| Client reaches the host's LAN or other devices | **Yes.** Userspace Tailscale with no routes. The only thing reachable is the target container on port 3260. |
-| A bug in the iSCSI server is exploited to break into the container | **Partly.** The containers are unprivileged apart from `NET_ADMIN`, but like any container they have normal outbound network access, including to the host's LAN. Keep the image updated. |
+| Client reaches the host's LAN or other devices | **Yes.** Userspace Tailscale with no routes, so tailnet traffic can only reach the iSCSI server on loopback. The firewall also blocks every private and link-local address. |
+| A bug in the iSCSI server is exploited to break into the container | **Contained.** The server runs as an unprivileged `tgt` user with no network beyond loopback: it can't reach the LAN or the internet. The container's filesystem is read-only, it can't gain privileges, and its only data is the encrypted image. Keep the images updated. |
+| Exfiltration of the host's data | **Blocked.** The containers can only see `DATA_DIR`, which holds ciphertext. They can't reach anything on the host's LAN, and only Tailscale's own traffic types can leave. Tailscale's log upload is turned off (`--no-logs-no-support`). |
 | Host reaches your other tailnet devices | **Yes**, if you apply the ACL above. |
 | Other people's devices on your tailnet attach or overwrite the disk | **Yes.** They'd need the iSCSI login, which is derived from an auth key only you and the host have seen. Narrowing the ACL `src` to your own login adds a second layer. |
 | Host deletes or withholds your data | **No.** It's their disk. Treat DockedFS as one copy in a 3-2-1 backup strategy, not as the only one. |
 | Host tampers with ciphertext | **Detected only partly.** Plain LUKS2 provides confidentiality, not integrity. Use a backup tool that verifies its data (restic, Borg), or add `--integrity hmac-sha256` to `luksFormat` (slower). |
 | Host learns metadata | The host can see how much is stored and when it's written, but not what it is. |
+
+### What the host's firewall allows
+
+Both containers share one network namespace, and `target/firewall.sh` sets it up at start:
+
+| Traffic | Allowed? |
+|---|---|
+| Anything to a private, link-local, CGNAT or multicast address (your LAN, router, NAS, Docker host, cloud metadata) | **No** |
+| Anything at all from the iSCSI server's `tgt` user, other than loopback | **No** |
+| Out to the internet: HTTPS and HTTP (Tailscale's control server and DERP relays) and UDP (WireGuard and STUN) | Yes |
+| Out to the internet on any other port | **No** |
+| In: replies, plus WireGuard UDP from public addresses | Yes |
+| In: anything else, including port 3260 from the host or LAN | **No** |
+
+DNS goes to Docker's built-in resolver on loopback. If the Tailscale container restarts, the target container notices and restarts too, so the rules are always in place. `FIREWALL=false` in `.env` turns all this off, which is only meant for debugging.
 
 DockedFS makes it technically impossible for the host to read your data. It is not legal advice. Hosts and clients are each responsible for what they store and where.
 

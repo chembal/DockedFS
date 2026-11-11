@@ -46,11 +46,13 @@ wait_ready() {
 uclient() { docker run --rm --network host "$CLIENT_IMG" "$@" 2>/dev/null; }
 
 echo "== building images"
-timeout 600 $COMPOSE build --progress plain > "$TEST_DATA_DIR/build.log" 2>&1 || { tail -40 "$TEST_DATA_DIR/build.log"; fail "image build"; }
-timeout 600 docker build -q --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" -t "$CLIENT_IMG" - >/dev/null <<'EOF' || fail "test client build"
+# Built on the host network: DNS inside CI's build bridge is flaky.
+timeout 600 docker build --network host --progress plain --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" \
+  -t dockedfs-target:local ../target > "$TEST_DATA_DIR/build.log" 2>&1 || { grep -E "Err:|E: |W: |attempt" "$TEST_DATA_DIR/build.log" | head -20; tail -15 "$TEST_DATA_DIR/build.log"; fail "image build"; }
+timeout 600 docker build -q --network host --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" -t "$CLIENT_IMG" - >/dev/null <<'EOF' || fail "test client build"
 FROM ubuntu:latest
 ARG UBUNTU_MIRROR=
-RUN if [ -n "$UBUNTU_MIRROR" ]; then sed -i "s#http://archive.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g; s#http://security.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g" /etc/apt/sources.list.d/ubuntu.sources; fi \
+RUN if [ -n "$UBUNTU_MIRROR" ]; then sed -i -E "s#https?://(archive|security)\.ubuntu\.com/ubuntu/?#$UBUNTU_MIRROR/#g" /etc/apt/sources.list.d/ubuntu.sources; fi \
  && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
  && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     libiscsi-bin qemu-utils qemu-block-extra && rm -rf /var/lib/apt/lists/*
@@ -65,6 +67,29 @@ size=$(stat -c %s "$TEST_DATA_DIR/disk.img")
 [ "$size" -eq 1073741824 ] || fail "image size $size"
 [ "$(du -k "$TEST_DATA_DIR/disk.img" | cut -f1)" -lt 1024 ] || fail "image is not sparse"
 ok "1G image created sparse"
+
+echo "== firewall (no LAN access, tgt has no network)"
+reach() { # reach <user> <ip> <port>: exit 0 if a TCP connect succeeds from inside the target
+  if [ "$1" = tgt ]; then
+    docker exec dockedfs-test-target setpriv --reuid tgt --regid tgt --init-groups timeout 5 bash -c "</dev/tcp/$2/$3" 2>/dev/null
+  else
+    docker exec dockedfs-test-target timeout 5 bash -c "</dev/tcp/$2/$3" 2>/dev/null
+  fi
+}
+GW=$(docker exec dockedfs-test-target ip -4 route show default | awk '{print $3; exit}')
+for dst in "$GW 53" "$GW 22" "192.168.1.1 80" "10.0.0.1 443" "172.17.0.1 2375" "169.254.169.254 80"; do
+  # shellcheck disable=SC2086
+  reach root $dst && fail "container reached private address $dst"
+done
+ok "private/LAN addresses unreachable (gateway, 192.168/16, 10/8, docker host, cloud metadata)"
+if timeout 5 bash -c "</dev/tcp/1.1.1.1/443" 2>/dev/null; then
+  reach root 1.1.1.1 443 || fail "Tailscale's HTTPS egress is blocked"
+  reach root 1.1.1.1 22 && fail "non-Tailscale port reachable on the internet"
+  reach tgt 1.1.1.1 443 && fail "the tgt user reached the internet"
+  ok "internet: HTTPS allowed for Tailscale, other ports blocked, tgt user blocked entirely"
+else
+  echo "  skip internet checks (this machine has no internet access)"
+fi
 
 echo "== protocol (userspace client)"
 uclient iscsi-inq "iscsi://127.0.0.1:$PORT/$IQN/1" >/dev/null 2>&1 && fail "login without CHAP succeeded"

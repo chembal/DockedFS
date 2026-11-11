@@ -1,6 +1,7 @@
 #!/bin/sh
 # DockedFS target: serves one sparse (or pre-allocated) disk image over iSCSI
-# with CHAP authentication and an optional bandwidth cap.
+# with CHAP authentication, an optional bandwidth cap, and a firewall that
+# keeps this host's LAN out of reach (see firewall.sh).
 set -eu
 
 STORAGE_SIZE="${STORAGE_SIZE:?set STORAGE_SIZE in .env, e.g. 500G}"
@@ -70,10 +71,33 @@ if [ -n "${MAX_BANDWIDTH_MBIT:-}" ] && [ "${MAX_BANDWIDTH_MBIT}" != "0" ]; then
   log "Bandwidth capped at ${MAX_BANDWIDTH_MBIT} Mbit/s in each direction"
 fi
 
+# --- Firewall ---------------------------------------------------------------
+if [ "${FIREWALL:-true}" = "false" ]; then
+  log "WARNING: FIREWALL=false. Nothing stops this container from reaching your LAN."
+else
+  /firewall.sh
+  log "Firewall on: no access to your LAN; only Tailscale may reach the internet"
+fi
+
 # --- iSCSI target -----------------------------------------------------------
-tgtd -f &
+# tgtd runs as the unprivileged "tgt" user and listens on loopback only:
+# userspace Tailscale hands it tailnet connections there, and the firewall
+# gives that user no network beyond loopback.
+LISTEN=127.0.0.1
+[ "${DOCKEDFS_TEST_PUBLISH:-false}" = true ] && LISTEN=0.0.0.0
+chown tgt "$IMAGE"
+# tgt must be able to reach the image; add only the traverse bit if needed.
+if ! setpriv --reuid tgt --regid tgt --init-groups test -r "$IMAGE"; then
+  chmod o+x /storage
+  log "Made DATA_DIR traversable (o+x) so the unprivileged iSCSI server can open the image"
+fi
+mkdir -p /run/tgtd && chown tgt /run/tgtd
+as_tgt() { setpriv --reuid tgt --regid tgt --init-groups "$@"; }
+as_tgt --inh-caps=+net_bind_service --ambient-caps=+net_bind_service \
+  tgtd -f --iscsi portal="$LISTEN:3260" &
 TGTD=$!
 trap 'kill "$TGTD" 2>/dev/null' TERM INT
+tgtadm() { as_tgt tgtadm "$@"; }
 
 i=0
 until tgtadm --lld iscsi --mode sys --op show >/dev/null 2>&1; do
@@ -93,4 +117,15 @@ fi
 tgtadm --lld iscsi --mode target --op bind --tid 1 --initiator-address ALL
 log "Ready: $IQN on port 3260 ($auth)"
 
+# If the tailscale container restarts, Docker gives it a new network namespace
+# (without our firewall) and leaves this one stranded. Exit so Docker restarts
+# us inside the new namespace, which re-applies the firewall.
+while kill -0 "$TGTD" 2>/dev/null; do
+  if ! ip -4 route show default | grep -q .; then
+    log "Network namespace changed (tailscale restarted); restarting to re-apply the firewall"
+    kill "$TGTD" 2>/dev/null || true
+    exit 1
+  fi
+  sleep 5
+done
 wait "$TGTD"
