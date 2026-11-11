@@ -5,7 +5,12 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
       sed -i "s#http://archive.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g; s#http://security.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g" \
         /etc/apt/sources.list.d/ubuntu.sources; \
     fi
-RUN apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+# apt-get update exits 0 even when every index fails; --error-on=any plus a retry
+# loop turns a flaky mirror into a slower build instead of a broken one.
+RUN for i in 1 2 3 4 5; do \
+      apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 --error-on=any update && break; \
+      echo "apt-get update failed (attempt $i), retrying"; sleep 15; \
+    done \
  && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends tgt iproute2 iptables util-linux \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --no-create-home --shell /usr/sbin/nologin tgt
