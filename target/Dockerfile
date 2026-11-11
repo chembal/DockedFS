@@ -2,9 +2,9 @@ FROM ubuntu:latest
 # Optional: a closer Ubuntu mirror, e.g. http://azure.archive.ubuntu.com/ubuntu
 ARG UBUNTU_MIRROR=
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-      sed -i "s#http://archive.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g; s#http://security.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g" \
+      sed -i -E "s#https?://(archive|security)\.ubuntu\.com/ubuntu/?#$UBUNTU_MIRROR/#g" \
         /etc/apt/sources.list.d/ubuntu.sources; \
-    fi
+    fi; grep URIs /etc/apt/sources.list.d/ubuntu.sources
 # apt-get update exits 0 even when every index fails; --error-on=any plus a retry
 # loop turns a flaky mirror into a slower build instead of a broken one.
 RUN for i in 1 2 3 4 5; do \

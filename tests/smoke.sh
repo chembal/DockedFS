@@ -50,7 +50,7 @@ timeout 600 $COMPOSE build --progress plain > "$TEST_DATA_DIR/build.log" 2>&1 ||
 timeout 600 docker build -q --network host --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" -t "$CLIENT_IMG" - >/dev/null <<'EOF' || fail "test client build"
 FROM ubuntu:latest
 ARG UBUNTU_MIRROR=
-RUN if [ -n "$UBUNTU_MIRROR" ]; then sed -i "s#http://archive.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g; s#http://security.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g" /etc/apt/sources.list.d/ubuntu.sources; fi \
+RUN if [ -n "$UBUNTU_MIRROR" ]; then sed -i -E "s#https?://(archive|security)\.ubuntu\.com/ubuntu/?#$UBUNTU_MIRROR/#g" /etc/apt/sources.list.d/ubuntu.sources; fi \
  && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
  && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     libiscsi-bin qemu-utils qemu-block-extra && rm -rf /var/lib/apt/lists/*
