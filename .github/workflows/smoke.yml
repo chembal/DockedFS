@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Lint shell scripts
-        run: shellcheck -S warning target/entrypoint.sh target/firewall.sh client/dockedfs-client.sh tests/smoke.sh
+        run: shellcheck -S warning update.sh target/entrypoint.sh target/firewall.sh client/dockedfs-client.sh tests/smoke.sh
 
       - name: Validate compose file
         run: cp .env.example .env && docker compose config -q
