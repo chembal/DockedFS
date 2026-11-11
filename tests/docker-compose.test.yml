@@ -4,6 +4,7 @@ services:
   target:
     build:
       context: ../target
+      network: host # use the machine's own DNS; CI's bridge DNS is flaky
       args:
         UBUNTU_MIRROR: ${UBUNTU_MIRROR:-}
     image: dockedfs-target:local

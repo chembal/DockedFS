@@ -46,8 +46,8 @@ wait_ready() {
 uclient() { docker run --rm --network host "$CLIENT_IMG" "$@" 2>/dev/null; }
 
 echo "== building images"
-timeout 600 $COMPOSE build --progress plain > "$TEST_DATA_DIR/build.log" 2>&1 || { tail -40 "$TEST_DATA_DIR/build.log"; fail "image build"; }
-timeout 600 docker build -q --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" -t "$CLIENT_IMG" - >/dev/null <<'EOF' || fail "test client build"
+timeout 600 $COMPOSE build --progress plain > "$TEST_DATA_DIR/build.log" 2>&1 || { grep -E "Err:|E: |W: |attempt" "$TEST_DATA_DIR/build.log" | head -20; tail -15 "$TEST_DATA_DIR/build.log"; fail "image build"; }
+timeout 600 docker build -q --network host --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" -t "$CLIENT_IMG" - >/dev/null <<'EOF' || fail "test client build"
 FROM ubuntu:latest
 ARG UBUNTU_MIRROR=
 RUN if [ -n "$UBUNTU_MIRROR" ]; then sed -i "s#http://archive.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g; s#http://security.ubuntu.com/ubuntu#$UBUNTU_MIRROR#g" /etc/apt/sources.list.d/ubuntu.sources; fi \
