@@ -63,7 +63,7 @@ You need Docker with the Compose plugin. Any Linux box, NAS or always-on PC with
 
 **Changing limits.** Edit `.env`, then run `docker compose up -d`. To grow the disk, raise `STORAGE_SIZE`, then have your friend resize on their side (see [Growing the disk](#growing-the-disk)). DockedFS **refuses to start if you lower `STORAGE_SIZE`**, because shrinking the image would destroy your friend's data.
 
-**Updating.** Now and then, run `git pull && docker compose pull --ignore-buildable && docker compose build --pull && docker compose up -d`. That picks up the latest Tailscale image and Ubuntu security fixes for the iSCSI server.
+**Updating.** Now and then, run `./update.sh` from your DockedFS folder. It shows each step as it goes: it pulls the latest code, downloads the latest Tailscale image, rebuilds the iSCSI server with the latest Ubuntu security fixes, restarts, and waits until the server reports Ready. Your `.env`, the disk image and Tailscale's login are kept. If a step fails, it stops there and your current setup keeps running. To do the same by hand, run `git pull && docker compose pull --ignore-buildable && docker compose build --pull && docker compose up -d`.
 
 **Stopping for good.** Tell your friend first. Then run `docker compose down` and delete `DATA_DIR/disk.img`.
 
