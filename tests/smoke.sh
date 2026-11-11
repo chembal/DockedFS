@@ -46,7 +46,9 @@ wait_ready() {
 uclient() { docker run --rm --network host "$CLIENT_IMG" "$@" 2>/dev/null; }
 
 echo "== building images"
-timeout 600 $COMPOSE build --progress plain > "$TEST_DATA_DIR/build.log" 2>&1 || { grep -E "Err:|E: |W: |attempt" "$TEST_DATA_DIR/build.log" | head -20; tail -15 "$TEST_DATA_DIR/build.log"; fail "image build"; }
+# Built on the host network: DNS inside CI's build bridge is flaky.
+timeout 600 docker build --network host --progress plain --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" \
+  -t dockedfs-target:local ../target > "$TEST_DATA_DIR/build.log" 2>&1 || { grep -E "Err:|E: |W: |attempt" "$TEST_DATA_DIR/build.log" | head -20; tail -15 "$TEST_DATA_DIR/build.log"; fail "image build"; }
 timeout 600 docker build -q --network host --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" -t "$CLIENT_IMG" - >/dev/null <<'EOF' || fail "test client build"
 FROM ubuntu:latest
 ARG UBUNTU_MIRROR=
