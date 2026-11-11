@@ -6,9 +6,10 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
         /etc/apt/sources.list.d/ubuntu.sources; \
     fi
 RUN apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
- && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends tgt iproute2 \
- && rm -rf /var/lib/apt/lists/*
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+ && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends tgt iproute2 iptables util-linux \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --no-create-home --shell /usr/sbin/nologin tgt
+COPY entrypoint.sh firewall.sh /
+RUN chmod +x /entrypoint.sh /firewall.sh
 EXPOSE 3260
 ENTRYPOINT ["/entrypoint.sh"]
