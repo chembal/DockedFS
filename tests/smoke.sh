@@ -87,12 +87,14 @@ ok "shrinking refused, image untouched"
 echo "== default mode: CHAP login derived from the Tailscale auth key"
 TEST_AUTHKEY=tskey-auth-smoketest-0123456789abcdef
 DERIVED_PW=$(printf %s "$TEST_AUTHKEY" | sha256sum | cut -c1-16)
+DERIVED_USER=$(printf %s "$TEST_AUTHKEY" | sha256sum | cut -c17-32)
 export TEST_AUTHKEY TEST_CHAP_USER="" TEST_CHAP_PASSWORD=""
 t=$(date +%s); $COMPOSE up -d >/dev/null 2>&1; wait_ready "$t"
 docker logs --since "$t" dockedfs-test-target 2>&1 | grep -q "derived from TS_AUTHKEY" || fail "target did not derive CHAP"
 uclient iscsi-inq "iscsi://127.0.0.1:$PORT/$IQN/1" >/dev/null 2>&1 && fail "derived mode allowed login without CHAP"
-uclient qemu-io -f raw -c "read -P 0x5a 0 64M" "iscsi://dockedfs%$DERIVED_PW@127.0.0.1:$PORT/$IQN/1" | grep -q "read 67108864" \
+uclient qemu-io -f raw -c "read -P 0x5a 0 64M" "iscsi://$DERIVED_USER%$DERIVED_PW@127.0.0.1:$PORT/$IQN/1" | grep -q "read 67108864" \
   || fail "derived CHAP login failed"
+uclient iscsi-inq "iscsi://dockedfs%$DERIVED_PW@127.0.0.1:$PORT/$IQN/1" >/dev/null 2>&1 && fail "old fixed username still accepted"
 ok "derived CHAP: key holder logs in, others rejected"
 TEST_AUTHKEY="" $COMPOSE run --rm --no-deps -T target 2>&1 | grep -q "TS_AUTHKEY is needed" || fail "missing key not reported"
 ok "refuses to run open when the key is missing"
