@@ -13,6 +13,8 @@ services:
       - TS_ACCEPT_DNS=false
       # Don't upload this node's logs to Tailscale.
       - TS_TAILSCALED_EXTRA_ARGS=--no-logs-no-support
+      # Control server: Tailscale's own unless TS_LOGIN_SERVER (e.g. Headscale) is set.
+      - TS_EXTRA_ARGS=--login-server=${TS_LOGIN_SERVER:-https://controlplane.tailscale.com}
     volumes:
       - ts-state:/var/lib/tailscale
     restart: unless-stopped
@@ -46,6 +48,7 @@ services:
       - CHAP_USER=${CHAP_USER:-}
       - CHAP_PASSWORD=${CHAP_PASSWORD:-}
       - FIREWALL=${FIREWALL:-true}
+      - TS_LOGIN_SERVER=${TS_LOGIN_SERVER:-} # the firewall lets this server through
     volumes:
       - ${DATA_DIR:-./data}:/storage
     restart: unless-stopped

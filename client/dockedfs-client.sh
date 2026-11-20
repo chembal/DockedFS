@@ -258,7 +258,14 @@ wizard_authkey() {
   local k
   while :; do
     ask_secret k "Auth key"
-    case "$k" in tskey-auth-*) break ;; *) warn "that doesn't look like an auth key (it starts with tskey-auth-)" ;; esac
+    # Tailscale keys start with tskey-auth-; Headscale's with hskey-auth- (or,
+    # before 0.26, are plain hex).
+    case "$k" in
+      tskey-auth-*|hskey-auth-*) break ;;
+      *[!0-9a-f]*|'') ;;
+      *) [ "${#k}" -ge 32 ] && break ;;
+    esac
+    warn "that doesn't look like an auth key (Tailscale's start with tskey-auth-, Headscale's with hskey-auth-)"
   done
   save DOCKEDFS_AUTHKEY "$k"
   good "saved to $CONFIG (readable by root only)"
