@@ -91,6 +91,17 @@ else
   echo "  skip internet checks (this machine has no internet access)"
 fi
 
+echo "== custom control server (TS_LOGIN_SERVER, e.g. Headscale on the LAN)"
+t=$(date +%s); TEST_LOGIN_SERVER=http://192.168.77.7:8080/ $COMPOSE up -d >/dev/null 2>&1; wait_ready "$t"
+docker exec dockedfs-test-target iptables -S DOCKEDFS-OUT | grep -q -- "-d 192.168.77.7/32 -p tcp -m tcp --dport 8080 -j ACCEPT"   || { docker exec dockedfs-test-target iptables -S DOCKEDFS-OUT; fail "custom control server not allowed through the firewall"; }
+reach root 192.168.77.7 22 && fail "control server reachable on a port other than its own"
+reach root 192.168.77.8 8080 && fail "a LAN address other than the control server is reachable"
+reach tgt 192.168.77.7 8080 && fail "the tgt user reached the control server"
+ok "only the control server's own address and port are opened"
+TEST_LOGIN_SERVER=ftp://example.com $COMPOSE run --rm --no-deps -T target 2>&1 | grep -q "must start with https:// or http://"   || fail "bad TS_LOGIN_SERVER not refused"
+ok "malformed TS_LOGIN_SERVER refused"
+t=$(date +%s); $COMPOSE up -d >/dev/null 2>&1; wait_ready "$t"   # back to the default control server
+
 echo "== protocol (userspace client)"
 uclient iscsi-inq "iscsi://127.0.0.1:$PORT/$IQN/1" >/dev/null 2>&1 && fail "login without CHAP succeeded"
 ok "login without CHAP rejected"

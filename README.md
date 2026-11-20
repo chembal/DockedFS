@@ -47,6 +47,7 @@ You need Docker with the Compose plugin. Any Linux box, NAS or always-on PC with
    | Setting | What it does |
    |---|---|
    | `TS_AUTHKEY` | Auth key from your friend. It joins this host to *their* tailnet. |
+   | `TS_LOGIN_SERVER` | Only if your friend runs [Headscale](#using-headscale-instead-of-tailscale): their control server's URL, e.g. `https://hs.example.com`. Leave it empty for Tailscale. |
    | `CHAP_USER`, `CHAP_PASSWORD` | Advanced, and empty by default. The iSCSI (CHAP) login is then derived from `TS_AUTHKEY`, so only your friend can attach the disk. Set both only to use an explicit login instead (password must be 12 to 16 characters). |
    | `CHAP_DISABLE` | `true` turns the iSCSI login off, so only the tailnet ACL controls access. Not recommended. |
    | `DATA_DIR` | Folder on this machine where the disk image lives. |
@@ -91,6 +92,16 @@ In the [Tailscale admin console](https://login.tailscale.com/admin/acls), add a 
 Then [generate an auth key](https://login.tailscale.com/admin/settings/keys) that is **reusable: off, pre-approved: on, tags: `tag:dockedfs`**. Send it to your friend privately, not in a group chat or anywhere public. Once their host has joined, the key can't be used to add any other device. **Keep a copy:** the iSCSI login is derived from it, so nobody else on your tailnet can attach or overwrite the disk, and there's no second password to exchange.
 
 > **The tag matters.** A key without a tag joins the host as *your* device. Under the default "allow all" policy, your friend's machine could then reach every device on your tailnet. Once the host is up, `tailscale status` should list it as `tagged-devices`, not under your login.
+
+### Using Headscale instead of Tailscale
+
+If you run your own [Headscale](https://headscale.net) control server, DockedFS works the same way. Only the control server changes:
+
+- **Host:** set `TS_LOGIN_SERVER` in `.env` to your server's URL, e.g. `https://hs.example.com` (add the port if it isn't 443, e.g. `http://192.168.1.10:8080`). Do this before the first start, because the auth key only works on the server that made it. To switch an existing host, run `docker compose down -v` (this resets Tailscale's login, not the disk image), set `TS_LOGIN_SERVER`, put in a fresh auth key and start it again. Keep the old key in `.env` if your friend should keep using the same iSCSI login, or set `CHAP_USER`/`CHAP_PASSWORD` explicitly.
+- **Client:** join your machine to your Headscale tailnet as usual (`sudo tailscale up --login-server https://hs.example.com`), then run the setup below. It accepts Headscale auth keys too.
+- **Tag and ACL:** put the same rule in your Headscale [policy file](https://headscale.net/stable/ref/acls/) (`tagOwners` for `tag:dockedfs`, and an `acls` entry allowing only your user to reach `tag:dockedfs:3260`). Then make a single-use, tagged key, e.g. `headscale preauthkeys create --user <you> --expiration 24h --tags tag:dockedfs` (check `headscale preauthkeys create --help`, as flags vary between versions). As with Tailscale, the tag is what stops the host joining as one of your own devices.
+
+The host's firewall lets the control server through even if it uses a non-standard port or sits on a private address (your LAN or another VPN). Only that one address and port are opened, plus UDP 3478 for STUN if Headscale runs its own DERP relay. The address is looked up when the host starts, so restart it (`docker compose restart`) if your server's IP changes.
 
 ### 2. Run the setup
 
@@ -225,6 +236,7 @@ Both containers share one network namespace, and `target/firewall.sh` sets it up
 | Anything at all from the iSCSI server's `tgt` user, other than loopback | **No** |
 | Out to the internet: HTTPS and HTTP (Tailscale's control server and DERP relays) and UDP (WireGuard and STUN) | Yes |
 | Out to the internet on any other port | **No** |
+| Out to a custom control server set in `TS_LOGIN_SERVER` (e.g. Headscale), on its own port and address, even a private one | Yes, that address and port only (plus UDP 3478 for STUN) |
 | In: replies, plus WireGuard UDP from public addresses | Yes |
 | In: anything else, including port 3260 from the host or LAN | **No** |
 
@@ -240,7 +252,7 @@ DockedFS makes it technically impossible for the host to read your data. It is n
 
 ## Testing
 
-`./tests/smoke.sh` starts a throwaway target on localhost. It checks that a sparse disk is created, that CHAP rejects bad logins, that the login derived from the auth key works, that `CHAP_DISABLE` works, that data reads back correctly and survives a restart, and that shrinking is refused. Run it with `sudo -E` (with `open-iscsi` installed) to also test the real client path: LUKS2, xfs, mount, a check that the host only sees ciphertext, remount, growing the disk while it's online, and the guided setup end to end. CI runs the full version on every push.
+`./tests/smoke.sh` starts a throwaway target on localhost. It checks that a sparse disk is created, that the firewall blocks the LAN but lets a custom control server (`TS_LOGIN_SERVER`) through, that CHAP rejects bad logins, that the login derived from the auth key works, that `CHAP_DISABLE` works, that data reads back correctly and survives a restart, and that shrinking is refused. Run it with `sudo -E` (with `open-iscsi` installed) to also test the real client path: LUKS2, xfs, mount, a check that the host only sees ciphertext, remount, growing the disk while it's online, and the guided setup end to end. CI runs the full version on every push.
 
 ## License
 
