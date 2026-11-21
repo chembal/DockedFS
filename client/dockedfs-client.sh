@@ -15,6 +15,9 @@
 #   chap        print the CHAP login derived from the auth key
 #   connect     log in to the iSCSI target only
 #   init        non-interactive first-time format (needs DOCKEDFS_KEYFILE or a tty)
+#   uninstall [--keep-keys|--delete-keys]
+#               remove everything setup put on this machine; asks before
+#               deleting the encryption key (the remote disk is never touched)
 #
 # Settings live in /etc/dockedfs/client.conf (DOCKEDFS_CONFIG overrides the
 # path); environment variables win over the file:
@@ -28,7 +31,8 @@
 #   DOCKEDFS_KEYFILE   LUKS key file; without one you type a passphrase
 #   CHAP_USER, CHAP_PASSWORD   explicit login, if the host set one
 #   CHAP_DISABLE=true  the host runs without CHAP
-#   DOCKEDFS_ASSUME_YES=1  skip the "erase this disk?" confirmation
+#   DOCKEDFS_ASSUME_YES=1  skip confirmations ("erase this disk?", "uninstall?");
+#                          uninstall then keeps the key unless given --delete-keys
 set -eu
 
 SETTINGS="DOCKEDFS_AUTHKEY DOCKEDFS_HOST DOCKEDFS_PORT DOCKEDFS_IQN DOCKEDFS_NAME DOCKEDFS_MOUNT
@@ -231,6 +235,126 @@ status() {
   if [ "${DOCKEDFS_AUTOMOUNT:-no}" = yes ]; then say "boot:    mounts automatically"; else say "boot:    run 'sudo dockedfs-client mount' after a reboot"; fi
 }
 
+# -------------------------------------------------------------- uninstall ----
+UNIT=/etc/systemd/system/dockedfs.service
+BIN=/usr/local/sbin/dockedfs-client
+
+# Is there an iSCSI session to this target on any portal (an old host, too)?
+any_session() { iscsiadm -m session 2>/dev/null | awk -v t="$IQN" '$4 == t {f = 1} END {exit !f}'; }
+
+# Undo everything setup did on this machine. Nothing on the host is touched.
+# The encryption key and LUKS header backups are only deleted if you say so.
+uninstall() {
+  local keys=ask a f own_key=""
+  case "${1:-}" in
+    "") ;;
+    --keep-keys) keys=keep ;;
+    --delete-keys) keys=delete ;;
+    *) die "usage: dockedfs-client uninstall [--keep-keys|--delete-keys]" ;;
+  esac
+  [ "$keys" = ask ] && [ "${DOCKEDFS_ASSUME_YES:-0}" = 1 ] && keys=keep
+
+  # Key material that setup created. A key file elsewhere is yours: leave it alone.
+  local -a keyfiles=()
+  for f in "$KEYFILE" "$CONFDIR/$NAME.key"; do
+    [ -n "$f" ] && [ -f "$f" ] && [ "$(dirname "$f")" = "$CONFDIR" ] || continue
+    [ "$f" = "$own_key" ] && continue
+    own_key="$f"; keyfiles+=("$f")
+  done
+  for f in "$CONFDIR"/luks-header-*.img; do [ -e "$f" ] && keyfiles+=("$f"); done
+
+  step "Uninstall the DockedFS client"
+  say "This removes from this machine:"
+  if mountpoint -q "$MNT" || [ -b "$MAPPER" ] || any_session; then
+    say "  - the open disk: unmounts $MNT, locks it and disconnects"
+  fi
+  if command -v iscsiadm >/dev/null 2>&1 && iscsiadm -m node -T "$IQN" >/dev/null 2>&1; then
+    say "  - the saved iSCSI login for $IQN"
+  fi
+  [ ! -e "$UNIT" ] || say "  - dockedfs.service (mounting at boot)"
+  [ ! -e "$BIN" ]  || say "  - $BIN"
+  [ ! -e "$CONFIG" ] || say "  - $CONFIG (your settings and the auth key)"
+  [ ! -d "$MNT" ] || say "  - the mount point $MNT, if it's empty"
+  say "It leaves alone your encrypted data on your friend's host, Tailscale, and the"
+  say "packages setup may have installed (open-iscsi, cryptsetup, xfsprogs)."
+  if [ -n "$KEYFILE" ] && [ -e "$KEYFILE" ] && [ "$KEYFILE" != "$own_key" ]; then
+    say "Your key file $KEYFILE wasn't made by setup, so it's kept."
+  fi
+
+  if [ "${#keyfiles[@]}" -gt 0 ]; then
+    say ""
+    say "${B}Your keys${N}, in $CONFDIR:"
+    for f in "${keyfiles[@]}"; do say "  $(basename "$f")"; done
+    if [ -n "$own_key" ]; then
+      warn "$(basename "$own_key") is the only key to the data on your friend's host. Delete it, and that"
+      warn "data can never be decrypted again unless you saved a copy (setup asked you to)."
+    else
+      say "These are LUKS header backups: with your passphrase they recover the data if the start"
+      say "of the remote disk is ever damaged."
+    fi
+    if [ "$keys" = ask ]; then
+      if [ -n "$own_key" ] && [ -t 0 ] && [ -t 1 ]; then
+        say "If you haven't saved the key yet, here it is: $(cat "$own_key")"
+      fi
+      ask a "Type 'delete' to destroy them, or press Enter to keep them" ""
+      if [ "$a" = delete ]; then keys=delete; else keys=keep; fi
+    fi
+    if [ "$keys" = delete ]; then say "Keys: ${R}will be deleted${N}"; else say "Keys: kept in $CONFDIR"; fi
+  fi
+
+  say ""
+  if [ "${DOCKEDFS_ASSUME_YES:-0}" != 1 ]; then
+    yesno "Uninstall now?" n || die "stopped; nothing was changed"
+  fi
+
+  # Unmount first: if the disk is busy, stop here with nothing removed yet.
+  if mountpoint -q "$MNT" && ! umount "$MNT"; then
+    die "$MNT is in use. Close whatever is using it (see 'fuser -vm $MNT') and run uninstall again. Nothing was removed."
+  fi
+  do_umount
+  if any_session; then iscsiadm -m node -T "$IQN" --logout >/dev/null 2>&1 || warn "could not log out of $IQN"; fi
+  good "disconnected"
+
+  if command -v iscsiadm >/dev/null 2>&1 && iscsiadm -m node -T "$IQN" >/dev/null 2>&1; then
+    if iscsiadm -m node -T "$IQN" -o delete >/dev/null 2>&1; then good "removed the saved iSCSI login"
+    else warn "could not remove the iSCSI record; try: sudo iscsiadm -m node -T $IQN -o delete"; fi
+  fi
+
+  if [ -e "$UNIT" ]; then
+    systemctl disable --now -q dockedfs.service 2>/dev/null || true
+    rm -f "$UNIT"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed dockedfs.service 2>/dev/null || true
+    good "removed dockedfs.service"
+  fi
+  if [ -e "$BIN" ]; then rm -f "$BIN"; good "removed $BIN"; fi
+
+  if [ -d "$MNT" ] && ! mountpoint -q "$MNT"; then
+    if rmdir "$MNT" 2>/dev/null; then good "removed $MNT"; else warn "kept $MNT: it isn't empty"; fi
+  fi
+
+  if [ -e "$CONFIG" ]; then rm -f "$CONFIG"; good "removed $CONFIG"; fi
+  rm -f "$CONFDIR"/.conf.* "$CONFDIR"/.pass.*
+  if [ "${#keyfiles[@]}" -gt 0 ]; then
+    if [ "$keys" = delete ]; then
+      shred -u "${keyfiles[@]}" 2>/dev/null || rm -f "${keyfiles[@]}"
+      good "deleted your keys"
+    else
+      good "kept your keys in $CONFDIR"
+    fi
+  fi
+  if rmdir "$CONFDIR" 2>/dev/null; then good "removed $CONFDIR"; fi
+
+  step "Uninstalled"
+  if [ "${#keyfiles[@]}" -gt 0 ] && [ "$keys" != delete ]; then
+    say "To use the disk again, run setup again: it finds the kept key file and unlocks with it."
+    say "To finish removing it, delete $CONFDIR once your keys are saved elsewhere."
+  fi
+  say "Your encrypted data is still on your friend's host. If you're done with it, ask them to"
+  say "run 'docker compose down' and delete DATA_DIR/disk.img, then remove that machine from"
+  say "your tailnet (Tailscale admin console > Machines, or 'headscale nodes delete')."
+}
+
 # ----------------------------------------------------------- guided setup ----
 wizard_deps() {
   local missing=""
@@ -354,6 +478,12 @@ wizard_luks() {
   [ -b "$MAPPER" ] && return 0
   if cryptsetup isLuks "$DISK"; then
     if [ -n "$KEYFILE" ] && [ -r "$KEYFILE" ]; then
+      unlock; good "unlocked with $KEYFILE"; return 0
+    fi
+    # A key file kept by 'uninstall --keep-keys' (or copied back from a backup).
+    local kept="$CONFDIR/$NAME.key"
+    if [ -z "$KEYFILE" ] && [ -r "$kept" ] && cryptsetup open --test-passphrase --key-file="$kept" "$DISK" 2>/dev/null; then
+      save DOCKEDFS_KEYFILE "$kept"; KEYFILE="$kept"
       unlock; good "unlocked with $KEYFILE"; return 0
     fi
     step "Unlock your encrypted disk"
@@ -530,6 +660,7 @@ case "${1:-}" in
               format_luks; unlock; make_fs; do_mount
               say "initialized and mounted at $MNT; LUKS header backup: $HEADER_BACKUP" ;;
   chap)       need_chap; say "CHAP_USER=${CHAP_USER:-}"; say "CHAP_PASSWORD=${CHAP_PASSWORD:-}" ;;
-  -h|--help|help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' ;;
+  uninstall)  shift; uninstall "$@" ;;
+  -h|--help|help) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//' ;;
   *)          die "unknown command '$1' (try --help)" ;;
 esac
