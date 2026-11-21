@@ -233,4 +233,33 @@ client </dev/null > "$CLIENT_DIR/wizard3.log" 2>&1 || { cat "$CLIENT_DIR/wizard3
 [ "$(cat "$WMNT/file")" = hello ] || fail "data lost across wizard remount"
 ok "after unmount, re-running reconnects and remounts with the key file"
 
+echo "== uninstall"
+CONFD="$CLIENT_DIR/conf"
+client uninstall </dev/null >/dev/null 2>&1 && fail "uninstall ran without an answer about the keys"
+mountpoint -q "$WMNT" || fail "unanswered uninstall changed something"
+# Answers: keep the keys (Enter), then "Uninstall now?" yes.
+printf '\ny\n' | client uninstall > "$CLIENT_DIR/uninstall.log" 2>&1 || { cat "$CLIENT_DIR/uninstall.log"; fail "uninstall"; }
+mountpoint -q "$WMNT" && fail "still mounted after uninstall"
+[ -e "$WMNT" ] && fail "empty mount point left behind"
+iscsiadm -m session 2>/dev/null | grep -q "$IQN" && fail "still logged in after uninstall"
+iscsiadm -m node -T "$IQN" >/dev/null 2>&1 && fail "iSCSI record (with the CHAP login) left behind"
+[ -e /usr/local/sbin/dockedfs-client ] && fail "installed binary left behind"
+[ -e "$DOCKEDFS_CONFIG" ] && fail "config (with the auth key) left behind"
+[ -f "$kf" ] || fail "uninstall deleted the key without being asked to"
+ls "$CONFD"/luks-header-*.img >/dev/null 2>&1 || fail "uninstall deleted the header backups without being asked to"
+ok "uninstall: unmount, log out, remove iSCSI record, binary and config; keys kept by default"
+
+# Set up again: the kept key file is found, so no passphrase is asked.
+# Answers: auth key, host, mount point, mount at boot (no), "press Enter".
+printf '%s\n' "$TEST_AUTHKEY" 127.0.0.1 "$WMNT" n "" | client > "$CLIENT_DIR/wizard4.log" 2>&1 \
+  || { cat "$CLIENT_DIR/wizard4.log"; fail "setup after uninstall"; }
+[ "$(cat "$WMNT/file")" = hello ] || fail "data not readable with the kept key"
+ok "setup after uninstall reuses the kept key; data intact"
+
+DOCKEDFS_ASSUME_YES=1 client uninstall --delete-keys </dev/null >/dev/null 2>&1 || fail "uninstall --delete-keys"
+mountpoint -q "$WMNT" && fail "still mounted after uninstall --delete-keys"
+[ -e "$kf" ] && fail "--delete-keys kept the key file"
+ls "$CONFD"/luks-header-*.img >/dev/null 2>&1 && fail "--delete-keys kept the header backups"
+ok "uninstall --delete-keys removes the key and header backups"
+
 echo "PASS ($pass checks)"

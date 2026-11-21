@@ -134,6 +134,7 @@ sudo dockedfs-client status
 sudo dockedfs-client umount    # unmount, lock, disconnect
 sudo dockedfs-client mount     # connect, unlock, mount
 sudo dockedfs-client grow      # after your friend raises STORAGE_SIZE
+sudo dockedfs-client uninstall # remove it from this machine (see below)
 ```
 
 ### 3. Doing it by hand
@@ -211,6 +212,23 @@ sudo cryptsetup resize dockedfs
 sudo xfs_growfs /mnt/dockedfs
 ```
 
+### Uninstalling
+
+`sudo dockedfs-client uninstall` removes everything setup put on this machine. It lists what it will remove and asks before doing anything:
+
+- unmounts the disk, locks it and logs out of the iSCSI target;
+- deletes the saved iSCSI record, which holds the CHAP login;
+- disables and deletes `dockedfs.service` (mounting at boot);
+- deletes `/usr/local/sbin/dockedfs-client`;
+- deletes `/etc/dockedfs/client.conf`, which holds your settings and the auth key;
+- removes the mount point if it's empty.
+
+**Your encryption key is only deleted if you say so.** The key file and the LUKS header backups in `/etc/dockedfs` are the only way to read the data on your friend's host. Without them that data is gone for good, unless you saved a copy as setup asked. So uninstall shows you the key (when run in a terminal) and asks you to type `delete` to destroy it. Press Enter and they're kept. For scripts, pass `--keep-keys` or `--delete-keys` to skip that question. With `DOCKEDFS_ASSUME_YES=1` and neither flag, the keys are kept.
+
+If you kept the keys, running setup again later finds the key file and unlocks the disk with it, so you only re-enter the auth key and host. A key file you made yourself (outside `/etc/dockedfs`, via `DOCKEDFS_KEYFILE`) is never deleted.
+
+Uninstall never touches the remote disk, Tailscale, or the packages setup installed (`open-iscsi`, `cryptsetup`, `xfsprogs`; remove them with `apt` if nothing else needs them). To finish, ask your friend to [stop their host for good](#host-setup-the-friend-offering-space) (`docker compose down`, then delete `DATA_DIR/disk.img`), then remove that machine from your tailnet in the Tailscale admin console (or with `headscale nodes delete`).
+
 ## Security model
 
 | Threat | Protected? |
@@ -252,7 +270,7 @@ DockedFS makes it technically impossible for the host to read your data. It is n
 
 ## Testing
 
-`./tests/smoke.sh` starts a throwaway target on localhost. It checks that a sparse disk is created, that the firewall blocks the LAN but lets a custom control server (`TS_LOGIN_SERVER`) through, that CHAP rejects bad logins, that the login derived from the auth key works, that `CHAP_DISABLE` works, that data reads back correctly and survives a restart, and that shrinking is refused. Run it with `sudo -E` (with `open-iscsi` installed) to also test the real client path: LUKS2, xfs, mount, a check that the host only sees ciphertext, remount, growing the disk while it's online, and the guided setup end to end. CI runs the full version on every push.
+`./tests/smoke.sh` starts a throwaway target on localhost. It checks that a sparse disk is created, that the firewall blocks the LAN but lets a custom control server (`TS_LOGIN_SERVER`) through, that CHAP rejects bad logins, that the login derived from the auth key works, that `CHAP_DISABLE` works, that data reads back correctly and survives a restart, and that shrinking is refused. Run it with `sudo -E` (with `open-iscsi` installed) to also test the real client path: LUKS2, xfs, mount, a check that the host only sees ciphertext, remount, growing the disk while it's online, the guided setup end to end, and uninstalling (keeping the keys, setting up again with them, then deleting them). CI runs the full version on every push.
 
 ## License
 
