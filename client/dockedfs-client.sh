@@ -173,8 +173,7 @@ mp_blacklist() {
   { echo "# Written by dockedfs-client: keep multipathd off the DockedFS disk."
     echo "# 'dockedfs-client uninstall' removes this file."
     echo "blacklist {"
-    printf '%s
-' "$old" "wwid \"$1\"" | grep . | sed 's/^/    /'
+    printf '%s\n' "$old" "wwid \"$1\"" | grep . | sed 's/^/    /'
     echo "}"; } > "$MPCONF"
   systemctl reload multipathd 2>/dev/null || multipathd reconfigure >/dev/null 2>&1 || true
 }
@@ -222,7 +221,8 @@ stale_mapping() {
 
 unlock() {
   if stale_mapping; then
-    [ "$(dmsetup info -c --noheadings -o open "$NAME" | tr -d ' ')" = 0 ] ||       die "'$NAME' is still open on a disk that has gone; unmount it ('sudo umount $MNT') and run again"
+    [ "$(dmsetup info -c --noheadings -o open "$NAME" | tr -d ' ')" = 0 ] ||
+      die "'$NAME' is still open on a disk that has gone; unmount it ('sudo umount $MNT') and run again"
     warn "closing a leftover '$NAME' from an earlier connection"
     dmsetup remove "$NAME"
   fi
