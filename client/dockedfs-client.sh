@@ -210,7 +210,22 @@ release_multipath() {
 
 # ------------------------------------------------------------------- LUKS ----
 luks_key() { [ -n "$KEYFILE" ] && echo "--key-file=$KEYFILE" || true; }
+# A mapping left from an earlier connection: its disk has gone (the LUN came
+# back under a new name, e.g. sdj -> sdk), but the old "$NAME" is still there.
+stale_mapping() {
+  dmsetup info "$NAME" >/dev/null 2>&1 || return 1
+  local want have
+  want=$(lsblk -dno MAJ:MIN "$(readlink -f "$DISK")" 2>/dev/null | tr -d ' ')
+  have=$(dmsetup deps -o devno "$NAME" 2>/dev/null | sed -n 's/.*(\([0-9]*\), \([0-9]*\)).*/:/p')
+  [ -n "$want" ] && [ "$want" != "$have" ]
+}
+
 unlock() {
+  if stale_mapping; then
+    [ "$(dmsetup info -c --noheadings -o open "$NAME" | tr -d ' ')" = 0 ] ||       die "'$NAME' is still open on a disk that has gone; unmount it ('sudo umount $MNT') and run again"
+    warn "closing a leftover '$NAME' from an earlier connection"
+    dmsetup remove "$NAME"
+  fi
   [ -b "$MAPPER" ] && return 0
   release_multipath
   # shellcheck disable=SC2046
