@@ -195,10 +195,13 @@ release_multipath() {
     case "$uuid" in mpath-*) ;; *) continue ;; esac
     name=$(cat "$h/dm/name")
     mp_blacklist "${uuid#mpath-}"
+    # The reload above often removes the map by itself; flush it if it's still there.
     i=0
-    until multipath -f "$name" >/dev/null 2>&1; do
+    while [ -e "$h" ]; do
+      multipath -f "$name" >/dev/null 2>&1 || dmsetup remove "$name" >/dev/null 2>&1 || true
+      [ -e "$h" ] || break
       i=$((i + 1))
-      [ "$i" -ge 5 ] && die "multipathd is holding the disk as $name; run 'sudo multipath -f $name' and try again"
+      [ "$i" -ge 10 ] && die "multipathd is holding the disk as $name; run 'sudo multipath -f $name' and try again"
       sleep 1
     done
     good "released the disk from multipathd ($name); it will leave it alone from now on"
