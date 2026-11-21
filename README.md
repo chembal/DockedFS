@@ -220,6 +220,7 @@ sudo xfs_growfs /mnt/dockedfs
 - deletes the saved iSCSI record, which holds the CHAP login;
 - disables and deletes `dockedfs.service` (mounting at boot);
 - deletes `/usr/local/sbin/dockedfs-client`;
+- deletes `/etc/multipath/conf.d/dockedfs.conf`, if setup added it (see [Troubleshooting](#troubleshooting));
 - deletes `/etc/dockedfs/client.conf`, which holds your settings and the auth key;
 - removes the mount point if it's empty.
 
@@ -266,6 +267,7 @@ DockedFS makes it technically impossible for the host to read your data. It is n
 
 - **`[dockedfs] ERROR: STORAGE_SIZE ... smaller than the existing disk`**: set `STORAGE_SIZE` back to at least the current size.
 - **Login fails with "Authentication failure"**: the CHAP login doesn't match. Check that `DOCKEDFS_AUTHKEY` is exactly the key in the host's `.env` (`sudo dockedfs-client chap` prints the derived login).
+- **"Cannot use device ... which is in use (already mapped or mounted)"** on Ubuntu Server: `multipathd` wrapped the disk in a map such as `mpatha` (`lsblk` shows it under the disk). The client handles this itself. It adds the disk's WWID to a blacklist in `/etc/multipath/conf.d/dockedfs.conf` and releases the map, so update the client and run it again. By hand, run `sudo multipath -f mpatha` after adding the blacklist.
 - **Writes hang when the internet drops**: iSCSI queues I/O for `node.session.timeo.replacement_timeout` seconds (default 120) before failing. For long backups over flaky links, raise this value, and use a backup tool that can resume.
 
 ## Testing

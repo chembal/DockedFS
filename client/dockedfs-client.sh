@@ -161,10 +161,55 @@ connect() {
   done
 }
 
+# multipathd (on by default on Ubuntu Server) wraps new SCSI disks in a
+# device-mapper map such as "mpatha", which leaves the disk in use, so
+# cryptsetup refuses it. Blacklist this one disk's WWID, then release it.
+MPCONF=/etc/multipath/conf.d/dockedfs.conf
+
+mp_blacklist() {
+  grep -qF "wwid \"$1\"" "$MPCONF" 2>/dev/null && return 0
+  local old; old=$(grep -o 'wwid "[^"]*"' "$MPCONF" 2>/dev/null || true)
+  mkdir -p "$(dirname "$MPCONF")"
+  { echo "# Written by dockedfs-client: keep multipathd off the DockedFS disk."
+    echo "# 'dockedfs-client uninstall' removes this file."
+    echo "blacklist {"
+    printf '%s
+' "$old" "wwid \"$1\"" | grep . | sed 's/^/    /'
+    echo "}"; } > "$MPCONF"
+  systemctl reload multipathd 2>/dev/null || multipathd reconfigure >/dev/null 2>&1 || true
+}
+
+release_multipath() {
+  command -v multipath >/dev/null 2>&1 || return 0
+  local dev h uuid name wwid i
+  dev=$(basename "$(readlink -f "$DISK")")
+  command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+  # Block it before multipathd gets to it, where possible.
+  if systemctl is-active -q multipathd 2>/dev/null; then
+    wwid=$(udevadm info -q property -n "$dev" 2>/dev/null | sed -n 's/^ID_SERIAL=//p')
+    [ -z "$wwid" ] || mp_blacklist "$wwid"
+  fi
+  for h in /sys/block/"$dev"/holders/*; do
+    [ -r "$h/dm/uuid" ] || continue
+    uuid=$(cat "$h/dm/uuid")
+    case "$uuid" in mpath-*) ;; *) continue ;; esac
+    name=$(cat "$h/dm/name")
+    mp_blacklist "${uuid#mpath-}"
+    i=0
+    until multipath -f "$name" >/dev/null 2>&1; do
+      i=$((i + 1))
+      [ "$i" -ge 5 ] && die "multipathd is holding the disk as $name; run 'sudo multipath -f $name' and try again"
+      sleep 1
+    done
+    good "released the disk from multipathd ($name); it will leave it alone from now on"
+  done
+}
+
 # ------------------------------------------------------------------- LUKS ----
 luks_key() { [ -n "$KEYFILE" ] && echo "--key-file=$KEYFILE" || true; }
 unlock() {
   [ -b "$MAPPER" ] && return 0
+  release_multipath
   # shellcheck disable=SC2046
   cryptsetup open $(luks_key) "$DISK" "$NAME"
 }
@@ -177,6 +222,7 @@ backup_header() {
 }
 
 format_luks() {
+  release_multipath
   # shellcheck disable=SC2046
   cryptsetup luksFormat $BATCH -q --type luks2 --sector-size 4096 $(luks_key) "$DISK"
   backup_header
@@ -273,6 +319,7 @@ uninstall() {
   fi
   [ ! -e "$UNIT" ] || say "  - dockedfs.service (mounting at boot)"
   [ ! -e "$BIN" ]  || say "  - $BIN"
+  [ ! -e "$MPCONF" ] || say "  - $MPCONF (keeps multipathd off the disk)"
   [ ! -e "$CONFIG" ] || say "  - $CONFIG (your settings and the auth key)"
   [ ! -d "$MNT" ] || say "  - the mount point $MNT, if it's empty"
   say "It leaves alone your encrypted data on your friend's host, Tailscale, and the"
@@ -328,6 +375,11 @@ uninstall() {
     good "removed dockedfs.service"
   fi
   if [ -e "$BIN" ]; then rm -f "$BIN"; good "removed $BIN"; fi
+  if [ -e "$MPCONF" ]; then
+    rm -f "$MPCONF"
+    systemctl reload multipathd 2>/dev/null || true
+    good "removed $MPCONF"
+  fi
 
   if [ -d "$MNT" ] && ! mountpoint -q "$MNT"; then
     if rmdir "$MNT" 2>/dev/null; then good "removed $MNT"; else warn "kept $MNT: it isn't empty"; fi
