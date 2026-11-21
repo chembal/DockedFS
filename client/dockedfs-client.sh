@@ -216,7 +216,7 @@ stale_mapping() {
   dmsetup info "$NAME" >/dev/null 2>&1 || return 1
   local want have
   want=$(lsblk -dno MAJ:MIN "$(readlink -f "$DISK")" 2>/dev/null | tr -d ' ')
-  have=$(dmsetup deps -o devno "$NAME" 2>/dev/null | sed -n 's/.*(\([0-9]*\), \([0-9]*\)).*/:/p')
+  have=$(dmsetup deps -o devno "$NAME" 2>/dev/null | sed -n 's/.*(\([0-9]*\), \([0-9]*\)).*/\1:\2/p')
   [ -n "$want" ] && [ "$want" != "$have" ]
 }
 
