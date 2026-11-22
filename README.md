@@ -123,7 +123,7 @@ The script checks where you are and walks you through only what's left:
 6. Creates a filesystem (xfs by default, or ext4).
 7. Asks where to mount it (default `/mnt/dockedfs`) and makes it writable by you.
 8. Offers to **mount it at boot**. A systemd service retries until your friend's host is reachable.
-9. Shows exactly what to **put in your password manager**: the auth key, the encryption key and the LUKS header backup.
+9. Writes **`recovery-data.zip`** to the folder you ran it from, and shows what to **put in your password manager**. The zip holds `auth-key.txt`, `encryption-key.txt`, the LUKS header backup and a `README.txt` on restoring. Move it into your password manager (or anywhere off this machine), then delete it here.
 
 Run it again any time. Finished steps are skipped, and if everything is up it just shows the status. Your settings are kept in `/etc/dockedfs/client.conf`, which only root can read.
 
@@ -134,8 +134,24 @@ sudo dockedfs-client status
 sudo dockedfs-client umount    # unmount, lock, disconnect
 sudo dockedfs-client mount     # connect, unlock, mount
 sudo dockedfs-client grow      # after your friend raises STORAGE_SIZE
+sudo dockedfs-client list      # every connection on this machine
+sudo dockedfs-client backup-recovery-data [DIR]   # write recovery-data.zip again (default: current folder)
 sudo dockedfs-client uninstall # remove it from this machine (see below)
 ```
+
+**Recovering on a new machine.** Unzip `recovery-data.zip`, put the key back with `sudo mkdir -p /etc/dockedfs && sudo install -m 400 encryption-key.txt /etc/dockedfs/dockedfs.key`, and run the setup. Paste `auth-key.txt` when it asks for the auth key. It finds the key file and unlocks your existing disk instead of formatting it.
+
+### Using space on more than one host
+
+Each friend's host serves one disk, so each one is a separate **connection** with its own name. The one you get without a name is called `dockedfs`. To add another, pick a name (lowercase letters, digits and `-`) and run the setup with it:
+
+```sh
+./dockedfs-client.sh --name scott
+sudo dockedfs-client --name scott status   # every command takes --name
+sudo dockedfs-client list
+```
+
+Each connection gets its own settings (`/etc/dockedfs/scott.conf`), key file (`/etc/dockedfs/scott.key`), mount point (`/mnt/scott` by default), boot service (`dockedfs@scott.service`) and recovery zip (`recovery-data-scott.zip`). Setup refuses a host that another connection already uses, because two connections to one disk would corrupt it.
 
 ### 3. Doing it by hand
 
@@ -214,16 +230,16 @@ sudo xfs_growfs /mnt/dockedfs
 
 ### Uninstalling
 
-`sudo dockedfs-client uninstall` removes everything setup put on this machine. It lists what it will remove and asks before doing anything:
+`sudo dockedfs-client uninstall` removes a connection, and with the last one, everything setup put on this machine (use `--name` for other connections). It lists what it will remove and asks before doing anything:
 
 - unmounts the disk, locks it and logs out of the iSCSI target;
 - deletes the saved iSCSI record, which holds the CHAP login;
-- disables and deletes `dockedfs.service` (mounting at boot);
-- deletes `/usr/local/sbin/dockedfs-client`;
-- deletes `/etc/dockedfs/client.conf`, which holds your settings and the auth key;
-- removes the mount point if it's empty.
+- disables and deletes the connection's boot service (`dockedfs@NAME.service`, or `dockedfs.service` from older versions);
+- deletes the connection's settings (`/etc/dockedfs/client.conf` or `NAME.conf`), which hold the auth key;
+- removes the mount point if it's empty;
+- with the last connection only: deletes `/usr/local/sbin/dockedfs-client`, the `dockedfs@.service` template and `/etc/multipath/conf.d/dockedfs.conf` if setup added it (see [Troubleshooting](#troubleshooting)).
 
-**Your encryption key is only deleted if you say so.** The key file and the LUKS header backups in `/etc/dockedfs` are the only way to read the data on your friend's host. Without them that data is gone for good, unless you saved a copy as setup asked. So uninstall shows you the key (when run in a terminal) and asks you to type `delete` to destroy it. Press Enter and they're kept. For scripts, pass `--keep-keys` or `--delete-keys` to skip that question. With `DOCKEDFS_ASSUME_YES=1` and neither flag, the keys are kept.
+**Your encryption key is only deleted if you say so.** The key file and the LUKS header backups in `/etc/dockedfs` are the only way to read the data on your friend's host. Without them that data is gone for good, unless you saved a copy as setup asked (run `sudo dockedfs-client backup-recovery-data` first if you're not sure). So uninstall shows you the key (when run in a terminal) and asks you to type `delete` to destroy it. Press Enter and they're kept. For scripts, pass `--keep-keys` or `--delete-keys` to skip that question. With `DOCKEDFS_ASSUME_YES=1` and neither flag, the keys are kept.
 
 If you kept the keys, running setup again later finds the key file and unlocks the disk with it, so you only re-enter the auth key and host. A key file you made yourself (outside `/etc/dockedfs`, via `DOCKEDFS_KEYFILE`) is never deleted.
 
@@ -266,11 +282,12 @@ DockedFS makes it technically impossible for the host to read your data. It is n
 
 - **`[dockedfs] ERROR: STORAGE_SIZE ... smaller than the existing disk`**: set `STORAGE_SIZE` back to at least the current size.
 - **Login fails with "Authentication failure"**: the CHAP login doesn't match. Check that `DOCKEDFS_AUTHKEY` is exactly the key in the host's `.env` (`sudo dockedfs-client chap` prints the derived login).
+- **"Cannot use device ... which is in use (already mapped or mounted)"** on Ubuntu Server: `multipathd` wrapped the disk in a map such as `mpatha` (`lsblk` shows it under the disk). The client handles this itself. It adds the disk's WWID to a blacklist in `/etc/multipath/conf.d/dockedfs.conf` and releases the map, so update the client and run it again. By hand, run `sudo multipath -f mpatha` after adding the blacklist.
 - **Writes hang when the internet drops**: iSCSI queues I/O for `node.session.timeo.replacement_timeout` seconds (default 120) before failing. For long backups over flaky links, raise this value, and use a backup tool that can resume.
 
 ## Testing
 
-`./tests/smoke.sh` starts a throwaway target on localhost. It checks that a sparse disk is created, that the firewall blocks the LAN but lets a custom control server (`TS_LOGIN_SERVER`) through, that CHAP rejects bad logins, that the login derived from the auth key works, that `CHAP_DISABLE` works, that data reads back correctly and survives a restart, and that shrinking is refused. Run it with `sudo -E` (with `open-iscsi` installed) to also test the real client path: LUKS2, xfs, mount, a check that the host only sees ciphertext, remount, growing the disk while it's online, the guided setup end to end, and uninstalling (keeping the keys, setting up again with them, then deleting them). CI runs the full version on every push.
+`./tests/smoke.sh` starts a throwaway target on localhost. It checks that a sparse disk is created, that the firewall blocks the LAN but lets a custom control server (`TS_LOGIN_SERVER`) through, that CHAP rejects bad logins, that the login derived from the auth key works, that `CHAP_DISABLE` works, that data reads back correctly and survives a restart, and that shrinking is refused. Run it with `sudo -E` (with `open-iscsi` installed) to also test the real client path: LUKS2, xfs, mount, a check that the host only sees ciphertext, remount, growing the disk while it's online, the guided setup end to end, the recovery zip, and uninstalling (keeping the keys, setting up again with them, then deleting them). CI runs the full version on every push.
 
 ## License
 

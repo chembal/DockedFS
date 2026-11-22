@@ -6,27 +6,40 @@
 # mounting at boot, and backing up your keys. Run it again any time; finished
 # steps are skipped.
 #
+# Usage: dockedfs-client [--name NAME] [command]
+#
+# --name NAME picks a connection, so you can use space on more than one
+# friend's host. Each connection has its own settings, key, mount point
+# (/mnt/NAME) and boot service. Without --name you get the connection
+# called "dockedfs".
+#
 # Commands for scripts and day-to-day use:
 #   (none)      guided setup / status
 #   mount       connect, unlock and mount
 #   umount      unmount, lock and disconnect
 #   status      show session, unlock and mount state
+#   list        show every connection on this machine
 #   grow        pick up a larger STORAGE_SIZE from the host
 #   chap        print the CHAP login derived from the auth key
 #   connect     log in to the iSCSI target only
 #   init        non-interactive first-time format (needs DOCKEDFS_KEYFILE or a tty)
+#   backup-recovery-data [DIR]
+#               write recovery-data.zip (auth-key.txt, encryption-key.txt and
+#               the LUKS header backups) to DIR, default the current directory
 #   uninstall [--keep-keys|--delete-keys]
-#               remove everything setup put on this machine; asks before
-#               deleting the encryption key (the remote disk is never touched)
+#               remove this connection and, with the last one, everything else
+#               setup put on this machine; asks before deleting the encryption
+#               key (the remote disk is never touched)
 #
-# Settings live in /etc/dockedfs/client.conf (DOCKEDFS_CONFIG overrides the
-# path); environment variables win over the file:
+# Settings live in /etc/dockedfs/client.conf, or /etc/dockedfs/NAME.conf for
+# other connections (DOCKEDFS_CONFIG overrides the path); environment
+# variables win over the file:
 #   DOCKEDFS_AUTHKEY   the Tailscale auth key you gave the host (CHAP is derived from it)
 #   DOCKEDFS_HOST      the host's tailnet IP
 #   DOCKEDFS_PORT      iSCSI port                       (default 3260)
 #   DOCKEDFS_IQN       target name (default iqn.2026-11.io.dockedfs:storage)
-#   DOCKEDFS_NAME      device-mapper name               (default dockedfs)
-#   DOCKEDFS_MOUNT     mount point                      (default /mnt/dockedfs)
+#   DOCKEDFS_NAME      connection and device-mapper name (default dockedfs; same as --name)
+#   DOCKEDFS_MOUNT     mount point                      (default /mnt/NAME)
 #   DOCKEDFS_FS        filesystem for new disks         (default xfs)
 #   DOCKEDFS_KEYFILE   LUKS key file; without one you type a passphrase
 #   CHAP_USER, CHAP_PASSWORD   explicit login, if the host set one
@@ -69,7 +82,27 @@ yesno() {
 }
 
 # ----------------------------------------------------------------- config ----
-CONFIG="${DOCKEDFS_CONFIG:-/etc/dockedfs/client.conf}"
+DEFAULT_NAME=dockedfs
+
+SEL_NAME="${DOCKEDFS_NAME:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--name) [ $# -ge 2 ] || die "--name needs a value"; SEL_NAME=$2; shift 2 ;;
+    --name=*)  SEL_NAME=${1#--name=}; shift ;;
+    *) break ;;
+  esac
+done
+case "$SEL_NAME" in
+  "") ;;
+  client|-*|*[!a-z0-9-]*) die "connection names use lowercase letters, digits and '-' (and can't be 'client')" ;;
+esac
+[ "${#SEL_NAME}" -le 32 ] || die "connection names are at most 32 characters"
+if [ -n "$SEL_NAME" ]; then export DOCKEDFS_NAME="$SEL_NAME"; fi
+
+if [ -n "${DOCKEDFS_CONFIG:-}" ]; then CONFIG=$DOCKEDFS_CONFIG
+elif [ -z "$SEL_NAME" ] || [ "$SEL_NAME" = "$DEFAULT_NAME" ]; then CONFIG=/etc/dockedfs/client.conf
+else CONFIG=/etc/dockedfs/$SEL_NAME.conf
+fi
 CONFDIR=$(dirname "$CONFIG")
 
 load_config() {
@@ -92,15 +125,39 @@ save() {
   printf -v "$1" '%s' "$2"
 }
 
+# conf_get FILE KEY: one setting from another connection's config, without sourcing it
+conf_get() { sed -n "s/^$2='\(.*\)'\$/\1/p" "$1" 2>/dev/null | tail -1; }
+# conf_name FILE: the connection a config file belongs to
+conf_name() {
+  local n; n=$(conf_get "$1" DOCKEDFS_NAME)
+  if [ -n "$n" ]; then echo "$n"
+  elif [ "$(basename "$1")" = client.conf ]; then echo "$DEFAULT_NAME"
+  else basename "$1" .conf; fi
+}
+# all_configs / other_configs: config files of the connections on this machine
+all_configs() {
+  local f
+  for f in "$CONFDIR"/*.conf; do
+    [ -f "$f" ] && grep -q '^DOCKEDFS_' "$f" && echo "$f"
+  done
+  return 0
+}
+other_configs() { all_configs | grep -vxF "$CONFIG" || true; }
+
 apply_defaults() {
   PORT="${DOCKEDFS_PORT:-3260}"
   IQN="${DOCKEDFS_IQN:-iqn.2026-11.io.dockedfs:storage}"
-  NAME="${DOCKEDFS_NAME:-dockedfs}"
-  MNT="${DOCKEDFS_MOUNT:-/mnt/dockedfs}"
+  NAME="${DOCKEDFS_NAME:-$DEFAULT_NAME}"
+  MNT="${DOCKEDFS_MOUNT:-/mnt/$NAME}"
   FS="${DOCKEDFS_FS:-xfs}"
   KEYFILE="${DOCKEDFS_KEYFILE:-}"
   MAPPER="/dev/mapper/$NAME"
   BATCH=""; [ "${DOCKEDFS_ASSUME_YES:-0}" = 1 ] && BATCH="--batch-mode"
+  # How to run this connection's commands, for messages.
+  if [ "$NAME" = "$DEFAULT_NAME" ]; then CMD=dockedfs-client; RECOVERY_ZIP=recovery-data.zip
+  else CMD="dockedfs-client --name $NAME"; RECOVERY_ZIP="recovery-data-$NAME.zip"; fi
+  UNIT_NAME="dockedfs@$NAME.service"
+  DROPIN="/etc/systemd/system/$UNIT_NAME.d"
   if [ -z "${CHAP_USER:-}" ] && [ -n "${DOCKEDFS_AUTHKEY:-}" ]; then
     # Same derivation as the host: h = sha256(auth key); password h[0:16], user h[16:32]
     local h; h=$(printf %s "$DOCKEDFS_AUTHKEY" | sha256sum)
@@ -161,22 +218,96 @@ connect() {
   done
 }
 
+# multipathd (on by default on Ubuntu Server) wraps new SCSI disks in a
+# device-mapper map such as "mpatha", which leaves the disk in use, so
+# cryptsetup refuses it. Blacklist this one disk's WWID, then release it.
+MPCONF=/etc/multipath/conf.d/dockedfs.conf
+
+mp_blacklist() {
+  grep -qF "wwid \"$1\"" "$MPCONF" 2>/dev/null && return 0
+  local old; old=$(grep -o 'wwid "[^"]*"' "$MPCONF" 2>/dev/null || true)
+  mkdir -p "$(dirname "$MPCONF")"
+  { echo "# Written by dockedfs-client: keep multipathd off the DockedFS disk."
+    echo "# 'dockedfs-client uninstall' removes this file."
+    echo "blacklist {"
+    printf '%s\n' "$old" "wwid \"$1\"" | grep . | sed 's/^/    /'
+    echo "}"; } > "$MPCONF"
+  systemctl reload multipathd 2>/dev/null || multipathd reconfigure >/dev/null 2>&1 || true
+}
+
+release_multipath() {
+  command -v multipath >/dev/null 2>&1 || return 0
+  local dev h uuid name wwid i
+  dev=$(basename "$(readlink -f "$DISK")")
+  command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+  # Block it before multipathd gets to it, where possible.
+  if systemctl is-active -q multipathd 2>/dev/null; then
+    wwid=$(udevadm info -q property -n "$dev" 2>/dev/null | sed -n 's/^ID_SERIAL=//p')
+    [ -z "$wwid" ] || mp_blacklist "$wwid"
+  fi
+  for h in /sys/block/"$dev"/holders/*; do
+    [ -r "$h/dm/uuid" ] || continue
+    uuid=$(cat "$h/dm/uuid")
+    case "$uuid" in mpath-*) ;; *) continue ;; esac
+    name=$(cat "$h/dm/name")
+    mp_blacklist "${uuid#mpath-}"
+    # The reload above often removes the map by itself; flush it if it's still there.
+    i=0
+    while [ -e "$h" ]; do
+      multipath -f "$name" >/dev/null 2>&1 || dmsetup remove "$name" >/dev/null 2>&1 || true
+      [ -e "$h" ] || break
+      i=$((i + 1))
+      [ "$i" -ge 10 ] && die "multipathd is holding the disk as $name; run 'sudo multipath -f $name' and try again"
+      sleep 1
+    done
+    good "released the disk from multipathd ($name); it will leave it alone from now on"
+  done
+}
+
 # ------------------------------------------------------------------- LUKS ----
 luks_key() { [ -n "$KEYFILE" ] && echo "--key-file=$KEYFILE" || true; }
+# A mapping left from an earlier connection: its disk has gone (the LUN came
+# back under a new name, e.g. sdj -> sdk), but the old "$NAME" is still there.
+stale_mapping() {
+  dmsetup info "$NAME" >/dev/null 2>&1 || return 1
+  local want have
+  want=$(lsblk -dno MAJ:MIN "$(readlink -f "$DISK")" 2>/dev/null | tr -d ' ')
+  have=$(dmsetup deps -o devno "$NAME" 2>/dev/null | sed -n 's/.*(\([0-9]*\), \([0-9]*\)).*/\1:\2/p')
+  [ -n "$want" ] && [ "$want" != "$have" ]
+}
+
 unlock() {
+  if stale_mapping; then
+    [ "$(dmsetup info -c --noheadings -o open "$NAME" | tr -d ' ')" = 0 ] ||
+      die "'$NAME' is still open on a disk that has gone; unmount it ('sudo umount $MNT') and run again"
+    warn "closing a leftover '$NAME' from an earlier connection"
+    dmsetup remove "$NAME"
+  fi
   [ -b "$MAPPER" ] && return 0
+  release_multipath
   # shellcheck disable=SC2046
   cryptsetup open $(luks_key) "$DISK" "$NAME"
 }
 
+# This connection's LUKS header backups (older versions named them luks-header-DATE.img).
+header_backups() {
+  local f
+  for f in "$CONFDIR/luks-header-$NAME-"*.img; do [ -e "$f" ] && echo "$f"; done
+  if [ "$NAME" = "$DEFAULT_NAME" ]; then
+    for f in "$CONFDIR"/luks-header-[0-9]*.img; do [ -e "$f" ] && echo "$f"; done
+  fi
+  return 0
+}
+
 backup_header() {
-  local hdr; hdr="$CONFDIR/luks-header-$(date +%Y%m%d-%H%M%S).img"
+  local hdr; hdr="$CONFDIR/luks-header-$NAME-$(date +%Y%m%d-%H%M%S).img"
   cryptsetup luksHeaderBackup "$DISK" --header-backup-file "$hdr"
   chmod 400 "$hdr"
   HEADER_BACKUP="$hdr"
 }
 
 format_luks() {
+  release_multipath
   # shellcheck disable=SC2046
   cryptsetup luksFormat $BATCH -q --type luks2 --sector-size 4096 $(luks_key) "$DISK"
   backup_header
@@ -226,33 +357,123 @@ grow() {
 }
 
 status() {
+  say "name:    $NAME ($CONFIG)"
   say "host:    ${HOST:-not set} (port $PORT)"
   if [ -n "$HOST" ] && logged_in; then say "session: connected"; else say "session: not connected"; fi
   if [ -b "$MAPPER" ]; then say "disk:    unlocked"; else say "disk:    locked"; fi
   if mountpoint -q "$MNT"; then
     df -h "$MNT" | awk 'NR==2 {print "mount:   "$6" ("$3" used of "$2", "$4" free)"}'
   else say "mount:   not mounted ($MNT)"; fi
-  if [ "${DOCKEDFS_AUTOMOUNT:-no}" = yes ]; then say "boot:    mounts automatically"; else say "boot:    run 'sudo dockedfs-client mount' after a reboot"; fi
+  if [ "${DOCKEDFS_AUTOMOUNT:-no}" = yes ]; then say "boot:    mounts automatically ($UNIT_NAME)"; else say "boot:    run 'sudo $CMD mount' after a reboot"; fi
+}
+
+list_connections() {
+  local f n h m s found=""
+  while IFS= read -r f; do
+    [ -n "$found" ] || printf '%-16s %-16s %-28s %s\n' NAME HOST MOUNT STATE
+    found=1
+    n=$(conf_name "$f"); h=$(conf_get "$f" DOCKEDFS_HOST); m=$(conf_get "$f" DOCKEDFS_MOUNT)
+    m=${m:-/mnt/$n}
+    if mountpoint -q "$m"; then s=mounted; else s="not mounted"; fi
+    printf '%-16s %-16s %-28s %s\n' "$n" "${h:--}" "$m" "$s"
+  done < <(all_configs)
+  [ -n "$found" ] || say "No connections yet. Run $0 to set one up."
+}
+
+# ---------------------------------------------------------- recovery data ----
+# Write recovery-data.zip: everything needed to get the data back from a new
+# machine. It holds secrets, so it's readable by you only; move it off this
+# machine and delete it here.
+backup_recovery_data() {
+  local dir="${1:-$PWD}" out tmp f
+  [ -d "$dir" ] || die "no such directory: $dir"
+  dir=$(cd "$dir" && pwd)
+  [ -w "$dir" ] || die "can't write to $dir"
+  command -v python3 >/dev/null 2>&1 || command -v zip >/dev/null 2>&1 || \
+    die "writing a zip needs python3 or zip (sudo apt-get install zip)"
+  out="$dir/$RECOVERY_ZIP"
+  tmp=$(mktemp -d "$CONFDIR/.recovery.XXXXXX")
+  if [ -n "${DOCKEDFS_AUTHKEY:-}" ]; then
+    printf '%s\n' "$DOCKEDFS_AUTHKEY" > "$tmp/auth-key.txt"
+  else
+    warn "no auth key is saved for '$NAME', so auth-key.txt is left out"
+  fi
+  if [ -n "$KEYFILE" ] && [ -r "$KEYFILE" ]; then
+    cp "$KEYFILE" "$tmp/encryption-key.txt" || die "couldn't read $KEYFILE"
+  else
+    warn "you unlock '$NAME' with a passphrase, so there's no key file to include. Keep the passphrase in your password manager."
+  fi
+  while IFS= read -r f; do cp "$f" "$tmp/"; done < <(header_backups)
+  if [ -z "$(ls -A "$tmp")" ]; then rm -rf "$tmp"; die "nothing to back up for '$NAME' yet"; fi
+  cat > "$tmp/README.txt" <<EOF
+DockedFS recovery data for the connection "$NAME" (host ${HOST:-?}), made $(date '+%Y-%m-%d %H:%M').
+
+Keep this somewhere other than the machine it came from, such as a password
+manager, then delete the copy on that machine. Anyone with these files and
+access to the host can read your data.
+
+  auth-key.txt        The Tailscale auth key. The iSCSI login is derived from it.
+  encryption-key.txt  Unlocks your data. Without it, the data is gone for good.
+  luks-header-*.img   LUKS header backups. With the key, they recover the data
+                      if the start of the remote disk is ever damaged.
+
+Getting the data back on a new machine (with Tailscale connected):
+  sudo mkdir -p /etc/dockedfs && sudo chmod 700 /etc/dockedfs
+  sudo install -m 400 encryption-key.txt /etc/dockedfs/$NAME.key
+  ./dockedfs-client.sh$( [ "$NAME" = "$DEFAULT_NAME" ] || printf ' --name %s' "$NAME" )
+Paste auth-key.txt when it asks for the auth key. It finds the key file and
+unlocks the disk with it.
+
+Only if the disk's LUKS header is damaged (check the disk path first):
+  sudo cryptsetup luksHeaderRestore /dev/disk/by-path/...-lun-1 --header-backup-file luks-header-....img
+EOF
+  rm -f "$out"
+  if command -v python3 >/dev/null 2>&1; then
+    (umask 077; python3 -c '
+import os, sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+    for f in sorted(os.listdir(sys.argv[2])):
+        z.write(os.path.join(sys.argv[2], f), f)
+' "$out" "$tmp") || { rm -rf "$tmp"; die "couldn't write $out"; }
+  else
+    (umask 077; cd "$tmp" && zip -q -X "$out" ./*) || { rm -rf "$tmp"; die "couldn't write $out"; }
+  fi
+  rm -rf "$tmp"
+  chmod 600 "$out"
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then chown "$SUDO_USER:" "$out"; fi
+  good "wrote $out"
 }
 
 # -------------------------------------------------------------- uninstall ----
-UNIT=/etc/systemd/system/dockedfs.service
+OLD_UNIT=/etc/systemd/system/dockedfs.service   # single-connection unit of older versions
+TEMPLATE=/etc/systemd/system/dockedfs@.service
 BIN=/usr/local/sbin/dockedfs-client
 
 # Is there an iSCSI session to this target on any portal (an old host, too)?
 any_session() { iscsiadm -m session 2>/dev/null | awk -v t="$IQN" '$4 == t {f = 1} END {exit !f}'; }
+# Does this connection have a saved iSCSI record? With the last connection, any portal counts.
+has_record() {
+  command -v iscsiadm >/dev/null 2>&1 || return 1
+  if [ "$1" = 1 ]; then iscsiadm -m node -T "$IQN" >/dev/null 2>&1
+  else [ -n "$HOST" ] && iscsi >/dev/null 2>&1; fi
+}
 
-# Undo everything setup did on this machine. Nothing on the host is touched.
-# The encryption key and LUKS header backups are only deleted if you say so.
+# Undo what setup did for this connection, and with the last connection,
+# everything shared too. Nothing on the host is touched. The encryption key
+# and LUKS header backups are only deleted if you say so.
 uninstall() {
-  local keys=ask a f own_key=""
+  local keys=ask a f own_key="" last=1
   case "${1:-}" in
     "") ;;
     --keep-keys) keys=keep ;;
     --delete-keys) keys=delete ;;
-    *) die "usage: dockedfs-client uninstall [--keep-keys|--delete-keys]" ;;
+    *) die "usage: $CMD uninstall [--keep-keys|--delete-keys]" ;;
   esac
   [ "$keys" = ask ] && [ "${DOCKEDFS_ASSUME_YES:-0}" = 1 ] && keys=keep
+
+  local -a others=()
+  while IFS= read -r f; do others+=("$(conf_name "$f")"); done < <(other_configs)
+  [ "${#others[@]}" -eq 0 ] || last=0
 
   # Key material that setup created. A key file elsewhere is yours: leave it alone.
   local -a keyfiles=()
@@ -261,20 +482,30 @@ uninstall() {
     [ "$f" = "$own_key" ] && continue
     own_key="$f"; keyfiles+=("$f")
   done
-  for f in "$CONFDIR"/luks-header-*.img; do [ -e "$f" ] && keyfiles+=("$f"); done
+  while IFS= read -r f; do keyfiles+=("$f"); done < <(header_backups)
 
-  step "Uninstall the DockedFS client"
+  local units=""
+  [ "$NAME" != "$DEFAULT_NAME" ] || [ ! -e "$OLD_UNIT" ] || units=1
+  [ ! -d "$DROPIN" ] || units=1
+  if systemctl is-enabled -q "$UNIT_NAME" 2>/dev/null; then units=1; fi
+
+  step "Uninstall the DockedFS connection '$NAME'"
   say "This removes from this machine:"
-  if mountpoint -q "$MNT" || [ -b "$MAPPER" ] || any_session; then
+  if mountpoint -q "$MNT" || [ -b "$MAPPER" ] || { [ -n "$HOST" ] && logged_in; } || { [ "$last" = 1 ] && any_session; }; then
     say "  - the open disk: unmounts $MNT, locks it and disconnects"
   fi
-  if command -v iscsiadm >/dev/null 2>&1 && iscsiadm -m node -T "$IQN" >/dev/null 2>&1; then
-    say "  - the saved iSCSI login for $IQN"
-  fi
-  [ ! -e "$UNIT" ] || say "  - dockedfs.service (mounting at boot)"
-  [ ! -e "$BIN" ]  || say "  - $BIN"
-  [ ! -e "$CONFIG" ] || say "  - $CONFIG (your settings and the auth key)"
+  if has_record "$last"; then say "  - the saved iSCSI login"; fi
+  [ -z "$units" ] || say "  - $UNIT_NAME (mounting at boot)"
+  [ ! -e "$CONFIG" ] || say "  - $CONFIG (its settings and the auth key)"
   [ ! -d "$MNT" ] || say "  - the mount point $MNT, if it's empty"
+  if [ "$last" = 1 ]; then
+    [ ! -e "$TEMPLATE" ] || say "  - $TEMPLATE"
+    [ ! -e "$BIN" ]  || say "  - $BIN"
+    [ ! -e "$MPCONF" ] || say "  - $MPCONF (keeps multipathd off the disk)"
+  else
+    say "Kept for your other connections (${others[*]}): $BIN, the boot service template and"
+    say "the multipath blacklist. Uninstall those connections too to remove them."
+  fi
   say "It leaves alone your encrypted data on your friend's host, Tailscale, and the"
   say "packages setup may have installed (open-iscsi, cryptsetup, xfsprogs)."
   if [ -n "$KEYFILE" ] && [ -e "$KEYFILE" ] && [ "$KEYFILE" != "$own_key" ]; then
@@ -288,6 +519,7 @@ uninstall() {
     if [ -n "$own_key" ]; then
       warn "$(basename "$own_key") is the only key to the data on your friend's host. Delete it, and that"
       warn "data can never be decrypted again unless you saved a copy (setup asked you to)."
+      say "To save a copy first, stop here and run: sudo $CMD backup-recovery-data"
     else
       say "These are LUKS header backups: with your passphrase they recover the data if the start"
       say "of the remote disk is ever damaged."
@@ -312,22 +544,39 @@ uninstall() {
     die "$MNT is in use. Close whatever is using it (see 'fuser -vm $MNT') and run uninstall again. Nothing was removed."
   fi
   do_umount
-  if any_session; then iscsiadm -m node -T "$IQN" --logout >/dev/null 2>&1 || warn "could not log out of $IQN"; fi
+  if [ "$last" = 1 ] && any_session; then
+    iscsiadm -m node -T "$IQN" --logout >/dev/null 2>&1 || warn "could not log out of $IQN"
+  fi
   good "disconnected"
 
-  if command -v iscsiadm >/dev/null 2>&1 && iscsiadm -m node -T "$IQN" >/dev/null 2>&1; then
-    if iscsiadm -m node -T "$IQN" -o delete >/dev/null 2>&1; then good "removed the saved iSCSI login"
-    else warn "could not remove the iSCSI record; try: sudo iscsiadm -m node -T $IQN -o delete"; fi
+  if has_record "$last"; then
+    if [ "$last" = 1 ]; then iscsiadm -m node -T "$IQN" -o delete >/dev/null 2>&1; else iscsi -o delete >/dev/null 2>&1; fi \
+      && good "removed the saved iSCSI login" \
+      || warn "could not remove the iSCSI record; try: sudo iscsiadm -m node -T $IQN -p $PORTAL -o delete"
   fi
 
-  if [ -e "$UNIT" ]; then
-    systemctl disable --now -q dockedfs.service 2>/dev/null || true
-    rm -f "$UNIT"
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl reset-failed dockedfs.service 2>/dev/null || true
-    good "removed dockedfs.service"
+  if [ -n "$units" ]; then
+    systemctl disable --now -q "$UNIT_NAME" 2>/dev/null || true
+    rm -rf "$DROPIN"
+    if [ "$NAME" = "$DEFAULT_NAME" ] && [ -e "$OLD_UNIT" ]; then
+      systemctl disable --now -q dockedfs.service 2>/dev/null || true
+      rm -f "$OLD_UNIT"
+    fi
+    good "removed $UNIT_NAME"
   fi
-  if [ -e "$BIN" ]; then rm -f "$BIN"; good "removed $BIN"; fi
+  if [ "$last" = 1 ]; then
+    if [ -e "$TEMPLATE" ]; then rm -f "$TEMPLATE"; good "removed $TEMPLATE"; fi
+    if [ -e "$BIN" ]; then rm -f "$BIN"; good "removed $BIN"; fi
+    if [ -e "$MPCONF" ]; then
+      rm -f "$MPCONF"
+      systemctl reload multipathd 2>/dev/null || true
+      good "removed $MPCONF"
+    fi
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed "$UNIT_NAME" 2>/dev/null || true
+  fi
 
   if [ -d "$MNT" ] && ! mountpoint -q "$MNT"; then
     if rmdir "$MNT" 2>/dev/null; then good "removed $MNT"; else warn "kept $MNT: it isn't empty"; fi
@@ -335,6 +584,7 @@ uninstall() {
 
   if [ -e "$CONFIG" ]; then rm -f "$CONFIG"; good "removed $CONFIG"; fi
   rm -f "$CONFDIR"/.conf.* "$CONFDIR"/.pass.*
+  rm -rf "$CONFDIR"/.recovery.*
   if [ "${#keyfiles[@]}" -gt 0 ]; then
     if [ "$keys" = delete ]; then
       shred -u "${keyfiles[@]}" 2>/dev/null || rm -f "${keyfiles[@]}"
@@ -345,10 +595,10 @@ uninstall() {
   fi
   if rmdir "$CONFDIR" 2>/dev/null; then good "removed $CONFDIR"; fi
 
-  step "Uninstalled"
+  step "Uninstalled '$NAME'"
   if [ "${#keyfiles[@]}" -gt 0 ] && [ "$keys" != delete ]; then
     say "To use the disk again, run setup again: it finds the kept key file and unlocks with it."
-    say "To finish removing it, delete $CONFDIR once your keys are saved elsewhere."
+    say "To finish removing it, delete the keys above once they're saved elsewhere."
   fi
   say "Your encrypted data is still on your friend's host. If you're done with it, ask them to"
   say "run 'docker compose down' and delete DATA_DIR/disk.img, then remove that machine from"
@@ -409,6 +659,15 @@ for p in (d.get("Peer") or {}).values():
 ' || true
 }
 
+# host_user IP: the other connection already using this host, if any
+host_user() {
+  local f
+  while IFS= read -r f; do
+    [ "$(conf_get "$f" DOCKEDFS_HOST)" = "$1" ] && { conf_name "$f"; return 0; }
+  done < <(other_configs)
+  return 1
+}
+
 wizard_host() {
   [ -z "${DOCKEDFS_HOST:-}" ] || return 0
   step "Pick your friend's DockedFS host"
@@ -417,12 +676,15 @@ wizard_host() {
   elif ! tailscale status >/dev/null 2>&1; then
     warn "Tailscale isn't connected. Run 'sudo tailscale up' first."
   fi
-  local peers n choice ip
+  local peers n choice ip u pip pname pstate
   peers=$(list_dockedfs_peers)
   n=$(printf '%s' "$peers" | grep -c . || true)
   if [ "$n" -gt 0 ]; then
     say "DockedFS hosts on your tailnet (devices tagged tag:dockedfs):"
-    printf '%s\n' "$peers" | awk -F'\t' '{printf "  %d) %-40s %-16s %s\n", NR, $2, $1, $3}'
+    while IFS=$'\t' read -r pip pname pstate; do
+      if u=$(host_user "$pip"); then pstate="$pstate, used by '$u'"; fi
+      printf '%s\t%s\t%s\n' "$pip" "$pname" "$pstate"
+    done <<< "$peers" | awk -F'\t' '{printf "  %d) %-40s %-16s %s\n", NR, $2, $1, $3}'
     while :; do
       ask choice "Which one" 1
       [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le "$n" ] && break
@@ -435,6 +697,10 @@ wizard_host() {
     ask ip "Enter the host's tailnet IP or name instead"
     [ -n "$ip" ] || die "no host given"
     ip=$(resolve_host "$ip")
+  fi
+  # Each host serves one disk; two connections to it would corrupt it.
+  if u=$(host_user "$ip"); then
+    die "$ip is already used by the connection '$u'. Each host serves one disk: pick another host, or use 'sudo dockedfs-client --name $u'."
   fi
   save DOCKEDFS_HOST "$ip"
   good "using $ip"
@@ -548,28 +814,36 @@ wizard_mount() {
   fi
 }
 
+install_bin() { install -m 755 "$(readlink -f "$0")" "$BIN"; }
+
 install_unit() {
-  install -m 755 "$(readlink -f "$0")" /usr/local/sbin/dockedfs-client
-  cat > /etc/systemd/system/dockedfs.service <<EOF
+  install_bin
+  cat > "$TEMPLATE" <<'EOF'
 [Unit]
-Description=DockedFS remote encrypted disk ($MNT)
+Description=DockedFS remote encrypted disk (%i)
 Wants=network-online.target tailscaled.service
-After=network-online.target tailscaled.service iscsid.service
+After=network-online.target tailscaled.service iscsid.service multipathd.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-Environment=DOCKEDFS_CONFIG=$CONFIG
-ExecStart=/usr/local/sbin/dockedfs-client mount
-ExecStop=/usr/local/sbin/dockedfs-client umount
+ExecStart=/usr/local/sbin/dockedfs-client --name %i mount
+ExecStop=/usr/local/sbin/dockedfs-client --name %i umount
 Restart=on-failure
 RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  mkdir -p "$DROPIN"
+  printf '[Service]\nEnvironment=DOCKEDFS_CONFIG=%s\n' "$CONFIG" > "$DROPIN/config.conf"
+  # Older versions installed a single dockedfs.service for this connection.
+  if [ "$NAME" = "$DEFAULT_NAME" ] && [ -e "$OLD_UNIT" ]; then
+    systemctl disable -q dockedfs.service 2>/dev/null || true
+    rm -f "$OLD_UNIT"
+  fi
   systemctl daemon-reload
-  systemctl enable -q dockedfs.service
+  systemctl enable -q "$UNIT_NAME"
 }
 
 wizard_boot() {
@@ -578,25 +852,28 @@ wizard_boot() {
   step "Mount at boot"
   if [ -z "$KEYFILE" ]; then
     say "You unlock with a passphrase, so it can't mount by itself at boot."
-    say "After a reboot, run: sudo dockedfs-client mount"
-    install -m 755 "$(readlink -f "$0")" /usr/local/sbin/dockedfs-client
+    say "After a reboot, run: sudo $CMD mount"
+    install_bin
     save DOCKEDFS_AUTOMOUNT no
     return 0
   fi
   if yesno "Mount $MNT automatically at boot (retries until your friend's host is reachable)?" y; then
     install_unit
     save DOCKEDFS_AUTOMOUNT yes
-    good "enabled dockedfs.service"
+    good "enabled $UNIT_NAME"
   else
-    install -m 755 "$(readlink -f "$0")" /usr/local/sbin/dockedfs-client
+    install_bin
     save DOCKEDFS_AUTOMOUNT no
-    say "After a reboot, run: sudo dockedfs-client mount"
+    say "After a reboot, run: sudo $CMD mount"
   fi
 }
 
 wizard_reminder() {
   [ -z "${DOCKEDFS_SETUP_DONE:-}" ] || return 0
   step "Back up your keys. Do this now."
+  local zipped=""
+  if (backup_recovery_data "$PWD"); then zipped=1
+  else warn "couldn't write $RECOVERY_ZIP here; run 'sudo $CMD backup-recovery-data DIR' later"; fi
   say "If this machine dies, these are the only way back to your data. Put them in a password"
   say "manager (1Password, Bitwarden, KeePassXC...) or somewhere else that isn't this machine:"
   say ""
@@ -614,6 +891,11 @@ wizard_reminder() {
     say "  ${B}3. LUKS header backup${N}: $HEADER_BACKUP"
     say "     If the start of the remote disk is damaged, this plus your key recovers the data."
   fi
+  if [ -n "$zipped" ]; then
+    say ""
+    say "All of this is in ${B}$PWD/$RECOVERY_ZIP${N} (with instructions in README.txt)."
+    say "Move it into your password manager or off this machine, then delete it here."
+  fi
   say ""
   if [ "${DOCKEDFS_ASSUME_YES:-0}" != 1 ]; then
     local a; ask a "Press Enter once you've saved them" ""
@@ -622,7 +904,8 @@ wizard_reminder() {
 }
 
 wizard() {
-  say "${B}DockedFS client setup${N}  (settings: $CONFIG)"
+  say "${B}DockedFS client setup${N}: connection '$NAME'  (settings: $CONFIG)"
+  grep -q '^DOCKEDFS_NAME=' "$CONFIG" 2>/dev/null || save DOCKEDFS_NAME "$NAME"
   wizard_deps
   wizard_authkey; apply_defaults
   wizard_host;    apply_defaults
@@ -641,7 +924,8 @@ wizard() {
 # ------------------------------------------------------------------- main ----
 if [ "$(id -u)" -ne 0 ]; then
   command -v sudo >/dev/null 2>&1 || die "run as root"
-  exec sudo DOCKEDFS_CONFIG="$CONFIG" "$0" "$@"
+  env=(DOCKEDFS_CONFIG="$CONFIG"); [ -z "$SEL_NAME" ] || env+=(DOCKEDFS_NAME="$SEL_NAME")
+  exec sudo "${env[@]}" "$0" "$@"
 fi
 
 mkdir -p "$CONFDIR" && chmod 700 "$CONFDIR"
@@ -653,6 +937,7 @@ case "${1:-}" in
   mount)      do_mount; say "mounted at $MNT" ;;
   umount|unmount|disconnect) do_umount; say "disconnected" ;;
   status)     status ;;
+  list)       list_connections ;;
   grow)       grow ;;
   connect)    connect; say "connected: $DISK" ;;
   init)       connect
@@ -660,7 +945,8 @@ case "${1:-}" in
               format_luks; unlock; make_fs; do_mount
               say "initialized and mounted at $MNT; LUKS header backup: $HEADER_BACKUP" ;;
   chap)       need_chap; say "CHAP_USER=${CHAP_USER:-}"; say "CHAP_PASSWORD=${CHAP_PASSWORD:-}" ;;
+  backup-recovery-data) shift; backup_recovery_data "$@" ;;
   uninstall)  shift; uninstall "$@" ;;
-  -h|--help|help) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "$0" ;;
   *)          die "unknown command '$1' (try --help)" ;;
 esac

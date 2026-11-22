@@ -210,7 +210,8 @@ WMNT="$CLIENT_DIR/wizard-mnt"
 # Answers, in order: auth key, host (no tailscale on CI, so typed in), erase
 # confirmation, key choice (generate), filesystem (default), mount point,
 # mount at boot (no), "press Enter once you've saved the keys".
-printf '%s\n' "$TEST_AUTHKEY" 127.0.0.1 yes 1 "" "$WMNT" n "" | client > "$CLIENT_DIR/wizard.log" 2>&1 \
+# Run from $CLIENT_DIR: setup writes recovery-data.zip to the current directory.
+printf '%s\n' "$TEST_AUTHKEY" 127.0.0.1 yes 1 "" "$WMNT" n "" | (cd "$CLIENT_DIR" && client) > "$CLIENT_DIR/wizard.log" 2>&1 \
   || { cat "$CLIENT_DIR/wizard.log"; fail "guided setup"; }
 mountpoint -q "$WMNT" || { cat "$CLIENT_DIR/wizard.log"; fail "guided setup did not mount"; }
 grep -q "^DOCKEDFS_SETUP_DONE='yes'" "$DOCKEDFS_CONFIG" || fail "setup not recorded"
@@ -220,6 +221,22 @@ kf="$CLIENT_DIR/conf/dockedfs.key"
 grep -qF "$(cat "$kf")" "$CLIENT_DIR/wizard.log" || fail "generated key not shown in the backup reminder"
 grep -q "LUKS header backup" "$CLIENT_DIR/wizard.log" || fail "header backup not mentioned"
 ok "guided setup: key entry, host, LUKS with generated key, xfs, mount, key reminder"
+
+# check_recovery ZIP: holds the auth key, the encryption key and a header backup, readable by the user only
+check_recovery() {
+  [ "$(stat -c %a "$1")" = 600 ] || fail "$1 is not private"
+  python3 - "$1" "$TEST_AUTHKEY" "$kf" <<'PY' || fail "$1 contents"
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+names = z.namelist()
+assert z.read("auth-key.txt").decode().strip() == sys.argv[2], "auth key"
+assert z.read("encryption-key.txt") == open(sys.argv[3], "rb").read(), "encryption key"
+assert any(n.startswith("luks-header-") for n in names), "header backup"
+assert "README.txt" in names, "README"
+PY
+}
+check_recovery "$CLIENT_DIR/recovery-data.zip"
+ok "setup writes recovery-data.zip (auth-key.txt, encryption-key.txt, header backup)"
 
 echo hello > "$WMNT/file"
 client </dev/null > "$CLIENT_DIR/wizard2.log" 2>&1 || { cat "$CLIENT_DIR/wizard2.log"; fail "second run"; }
@@ -233,8 +250,17 @@ client </dev/null > "$CLIENT_DIR/wizard3.log" 2>&1 || { cat "$CLIENT_DIR/wizard3
 [ "$(cat "$WMNT/file")" = hello ] || fail "data lost across wizard remount"
 ok "after unmount, re-running reconnects and remounts with the key file"
 
+mkdir -p "$CLIENT_DIR/rd"
+client backup-recovery-data "$CLIENT_DIR/rd" </dev/null >/dev/null || fail "backup-recovery-data"
+check_recovery "$CLIENT_DIR/rd/recovery-data.zip"
+ok "backup-recovery-data writes the zip after the fact"
+
 echo "== uninstall"
 CONFD="$CLIENT_DIR/conf"
+# Pretend there's a second connection, so this uninstall must keep what's shared.
+rm -f "$CONFD/client.conf"
+printf "DOCKEDFS_NAME='other'\nDOCKEDFS_HOST='192.0.2.1'\n" > "$CONFD/other.conf"
+client list </dev/null | grep -q '^other ' || fail "list does not show the second connection"
 client uninstall </dev/null >/dev/null 2>&1 && fail "uninstall ran without an answer about the keys"
 mountpoint -q "$WMNT" || fail "unanswered uninstall changed something"
 # Answers: keep the keys (Enter), then "Uninstall now?" yes.
@@ -243,23 +269,25 @@ mountpoint -q "$WMNT" && fail "still mounted after uninstall"
 [ -e "$WMNT" ] && fail "empty mount point left behind"
 iscsiadm -m session 2>/dev/null | grep -q "$IQN" && fail "still logged in after uninstall"
 iscsiadm -m node -T "$IQN" >/dev/null 2>&1 && fail "iSCSI record (with the CHAP login) left behind"
-[ -e /usr/local/sbin/dockedfs-client ] && fail "installed binary left behind"
+[ -e /usr/local/sbin/dockedfs-client ] || fail "removed the binary although another connection uses it"
 [ -e "$DOCKEDFS_CONFIG" ] && fail "config (with the auth key) left behind"
 [ -f "$kf" ] || fail "uninstall deleted the key without being asked to"
 ls "$CONFD"/luks-header-*.img >/dev/null 2>&1 || fail "uninstall deleted the header backups without being asked to"
-ok "uninstall: unmount, log out, remove iSCSI record, binary and config; keys kept by default"
+ok "uninstall: unmount, log out, remove iSCSI record and config; keys kept by default; shared files kept"
 
 # Set up again: the kept key file is found, so no passphrase is asked.
 # Answers: auth key, host, mount point, mount at boot (no), "press Enter".
-printf '%s\n' "$TEST_AUTHKEY" 127.0.0.1 "$WMNT" n "" | client > "$CLIENT_DIR/wizard4.log" 2>&1 \
+printf '%s\n' "$TEST_AUTHKEY" 127.0.0.1 "$WMNT" n "" | (cd "$CLIENT_DIR" && client) > "$CLIENT_DIR/wizard4.log" 2>&1 \
   || { cat "$CLIENT_DIR/wizard4.log"; fail "setup after uninstall"; }
 [ "$(cat "$WMNT/file")" = hello ] || fail "data not readable with the kept key"
 ok "setup after uninstall reuses the kept key; data intact"
 
+rm -f "$CONFD/other.conf"   # now it's the last connection
 DOCKEDFS_ASSUME_YES=1 client uninstall --delete-keys </dev/null >/dev/null 2>&1 || fail "uninstall --delete-keys"
 mountpoint -q "$WMNT" && fail "still mounted after uninstall --delete-keys"
 [ -e "$kf" ] && fail "--delete-keys kept the key file"
 ls "$CONFD"/luks-header-*.img >/dev/null 2>&1 && fail "--delete-keys kept the header backups"
-ok "uninstall --delete-keys removes the key and header backups"
+[ -e /usr/local/sbin/dockedfs-client ] && fail "last uninstall left the binary behind"
+ok "uninstall --delete-keys removes the key, header backups and, as the last connection, the binary"
 
 echo "PASS ($pass checks)"
